@@ -95,8 +95,8 @@ class SwapServerGuiPlugin(BasePlugin):
         BasePlugin.__init__(self, parent, config, name)
         self.wallet: Optional['Abstract_Wallet'] = None
         self._sm: Optional['SwapManager'] = None
-        self._http_task: Optional[asyncio.Task] = None
-        self._nostr_task: Optional[asyncio.Task] = None
+        self._http_fut: Optional['concurrent.futures.Future'] = None
+        self._nostr_fut: Optional['concurrent.futures.Future'] = None
         self._running: bool = False
 
     # ------------------------------------------------------------------ utils
@@ -107,21 +107,30 @@ class SwapServerGuiPlugin(BasePlugin):
     def _loop(self) -> asyncio.AbstractEventLoop:
         return get_asyncio_loop()
 
-    def _spawn_task(self, coro) -> asyncio.Task:
-        """Create an asyncio.Task on the network loop and return it.
+    def _spawn(self, coro, label: str) -> 'concurrent.futures.Future':
+        """Schedule a coroutine on the network loop WITHOUT blocking the caller.
 
-        Runs from the GUI thread; the round-trip only creates the task, which is
-        instantaneous, so briefly blocking here is fine.
+        Must never call ``.result()`` here: this runs on the Qt GUI thread, and
+        the asyncio loop may be busy (e.g. the nostr announcement proof-of-work),
+        so blocking would freeze the UI and can raise TimeoutError.
+        ``run_coroutine_threadsafe`` returns immediately; the returned future's
+        ``.cancel()`` schedules cancellation of the underlying task on the loop.
         """
-        async def _make() -> asyncio.Task:
-            return asyncio.ensure_future(coro)
-        fut: concurrent.futures.Future = asyncio.run_coroutine_threadsafe(_make(), self._loop())
-        return fut.result(timeout=10)
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop())
 
-    def _cancel_task(self, task: Optional[asyncio.Task]) -> None:
-        if task is None:
-            return
-        self._loop().call_soon_threadsafe(task.cancel)
+        def _log_result(f: 'concurrent.futures.Future') -> None:
+            if f.cancelled():
+                return
+            exc = f.exception()
+            if exc is not None:
+                self.logger.warning(f"swap server task {label!r} ended with error: {exc!r}")
+        fut.add_done_callback(_log_result)
+        return fut
+
+    @staticmethod
+    def _cancel_fut(fut: Optional['concurrent.futures.Future']) -> None:
+        if fut is not None:
+            fut.cancel()
 
     # -------------------------------------------------------------- lifecycle
     def bind_wallet(self, wallet: 'Abstract_Wallet') -> None:
@@ -159,9 +168,9 @@ class SwapServerGuiPlugin(BasePlugin):
         if port:
             server = ManagedHttpSwapServer(self.config, self.wallet)
             sm.http_server = server
-            self._http_task = self._spawn_task(server.run())
+            self._http_fut = self._spawn(server.run(), "http")
         if relays:
-            self._nostr_task = self._spawn_task(sm.run_nostr_server())
+            self._nostr_fut = self._spawn(sm.run_nostr_server(), "nostr")
 
         self._running = True
         self.logger.info(f"swap server started (http_port={port or None}, "
@@ -172,20 +181,15 @@ class SwapServerGuiPlugin(BasePlugin):
         if not self._running:
             return
         sm = self._sm
-        # Stop the HTTP listener (needs an explicit runner cleanup).
-        if sm is not None and getattr(sm, 'http_server', None) is not None:
-            http_server = sm.http_server
-            if isinstance(http_server, ManagedHttpSwapServer):
-                try:
-                    fut = asyncio.run_coroutine_threadsafe(http_server.stop(), self._loop())
-                    fut.result(timeout=10)
-                except Exception:
-                    self.logger.exception("error while stopping swap server HTTP endpoint")
+        # Stop the HTTP listener (needs an explicit aiohttp runner cleanup).
+        # Schedule it on the loop fire-and-forget; do NOT block the GUI thread.
+        if sm is not None and isinstance(getattr(sm, 'http_server', None), ManagedHttpSwapServer):
+            self._spawn(sm.http_server.stop(), "http-stop")
             sm.http_server = None
-        self._cancel_task(self._http_task)
-        self._cancel_task(self._nostr_task)
-        self._http_task = None
-        self._nostr_task = None
+        self._cancel_fut(self._http_fut)
+        self._cancel_fut(self._nostr_fut)
+        self._http_fut = None
+        self._nostr_fut = None
         if sm is not None:
             sm.is_server = False
         self._running = False

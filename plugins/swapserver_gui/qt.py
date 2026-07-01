@@ -165,16 +165,21 @@ class SwapServerTab(QWidget):
         return ",".join(parts)
 
     def on_save(self) -> None:
-        port = self.port_spin.value()
-        relays = self._relays_from_widget()
+        new_port = self.port_spin.value() or None
+        new_relays = self._relays_from_widget()
+        old_port = self.config.SWAPSERVER_PORT
+        old_relays = self.config.NOSTR_RELAYS or ""
         # persist
-        self.config.SWAPSERVER_PORT = port if port else None
+        self.config.SWAPSERVER_PORT = new_port
         self.config.SWAPSERVER_FEE_MILLIONTHS = self.fee_spin.value()
         self.config.SWAPSERVER_POW_TARGET = self.pow_spin.value()
-        self.config.NOSTR_RELAYS = relays
+        self.config.NOSTR_RELAYS = new_relays
         self.load_settings_into_widgets()
-        # if the server is running, restart so port/relay changes take effect
-        if self.plugin.is_running():
+        # Only a port/relay change needs a server restart; the fee and PoW target
+        # are read live on each request/announcement. Restarting on every save
+        # would needlessly bounce the (busy) nostr transport.
+        transport_changed = (new_port != old_port) or (new_relays != old_relays)
+        if self.plugin.is_running() and transport_changed:
             self.plugin.stop_server()
             try:
                 self.plugin.start_server()

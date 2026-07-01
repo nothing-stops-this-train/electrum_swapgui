@@ -153,9 +153,9 @@ class NostrLifecycleTests(unittest.TestCase):
             with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop):
                 p.start_server()
                 self.assertTrue(sm.nostr_started.wait(timeout=5))
-                first_task = p._nostr_task
+                first_task = p._nostr_fut
                 p.start_server()  # no-op
-                self.assertIs(p._nostr_task, first_task)
+                self.assertIs(p._nostr_fut, first_task)
                 p.stop_server()
                 self.assertTrue(sm.nostr_cancelled.wait(timeout=5))
 
@@ -164,6 +164,28 @@ class NostrLifecycleTests(unittest.TestCase):
         p.bind_wallet(_make_wallet(_SwapManager()))
         with self.assertRaises(SwapServerError):
             p.start_server()
+
+    def test_restart_does_not_block_gui_thread_when_loop_busy(self):
+        # Regression: start_server/stop_server must never .result() on the caller
+        # (GUI) thread. Previously a restart while the asyncio loop was busy (e.g.
+        # generating the nostr announcement PoW) blocked ~10s and raised
+        # TimeoutError, crashing the GUI on "Save settings".
+        sm = _SwapManager()
+        p = _make_plugin(_Config(relays="wss://relay.one"))
+        p.bind_wallet(_make_wallet(sm))
+        with _LoopThread() as loop:
+            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop):
+                p.start_server()
+                self.assertTrue(sm.nostr_started.wait(timeout=5))
+                # Occupy the loop so it cannot service new work for ~3s.
+                loop.call_soon_threadsafe(lambda: time.sleep(2))
+                t0 = time.monotonic()
+                p.stop_server()          # must not block
+                p.start_server()         # must not block or raise TimeoutError
+                elapsed = time.monotonic() - t0
+                self.assertLess(elapsed, 1.0, f"restart blocked the caller for {elapsed:.2f}s")
+                self.assertTrue(p.is_running())
+                p.stop_server()
 
 
 class HttpLifecycleTests(unittest.TestCase):
