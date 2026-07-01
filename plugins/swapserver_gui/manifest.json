@@ -1,0 +1,8 @@
+{
+  "name": "swapserver_gui",
+  "fullname": "Swap Server (GUI)",
+  "author": "nothing-stops-this-train",
+  "description": "Adds a \"Swap Server\" tab to the Electrum Qt GUI for managing Electrum's built-in submarine swap server: enable/disable the server and edit all of its settings, and watch live output (pairs, liquidity, and swap history).",
+  "available_for": ["qt"],
+  "min_electrum_version": "4.7.2"
+}

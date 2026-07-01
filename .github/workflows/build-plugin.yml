@@ -1,0 +1,65 @@
+name: build-plugin
+
+# Builds the external-plugin zip and runs the unit tests.
+# The zip is a plain archive (no signing key/secret needed); users authorise it
+# locally on install via Electrum's Plugins dialog.
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout plugin repo
+        uses: actions/checkout@v4
+        with:
+          path: electrum_swapgui
+
+      - name: Checkout upstream Electrum (for imports during tests)
+        uses: actions/checkout@v4
+        with:
+          repository: spesmilo/electrum
+          ref: master
+          path: electrum
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install minimal test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Electrum's runtime deps needed to import the modules under test.
+          pip install -r electrum/contrib/requirements/requirements.txt
+          pip install aiohttp
+
+      - name: Run unit tests
+        env:
+          ELECTRUM_SRC: ${{ github.workspace }}/electrum
+        run: |
+          cd electrum_swapgui
+          python -m unittest discover -s tests -v
+
+      - name: Build plugin zip
+        run: |
+          cd electrum_swapgui
+          bash contrib/make_zip.sh "$GITHUB_WORKSPACE/dist"
+
+      - name: Upload plugin zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swapserver_gui-plugin
+          path: dist/swapserver_gui.zip
+          if-no-files-found: error
+
+      - name: Attach zip to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/swapserver_gui.zip
