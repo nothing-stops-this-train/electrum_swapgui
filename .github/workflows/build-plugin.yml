@@ -37,7 +37,9 @@ jobs:
           python -m pip install --upgrade pip
           # Electrum's runtime deps needed to import the modules under test.
           pip install -r electrum/contrib/requirements/requirements.txt
-          pip install aiohttp
+          # electrum/crypto.py requires one of these (normally pulled in
+          # transitively via the dnspython[DNSSEC] extra); install explicitly.
+          pip install aiohttp cryptography
 
       - name: Run unit tests
         env:
