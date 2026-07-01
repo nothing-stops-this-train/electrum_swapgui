@@ -11,6 +11,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Needed so the release step can create/update a GitHub Release on v* tags.
+permissions:
+  contents: write
+
 jobs:
   test-and-build:
     runs-on: ubuntu-latest
