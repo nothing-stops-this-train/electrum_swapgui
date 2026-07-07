@@ -53,6 +53,10 @@ class _SwapManager:
         self.nostr_started = threading.Event()
         self.nostr_cancelled = threading.Event()
         self.pairs_updates = 0
+        self.pow_calls = 0
+        # by default there is no liquidity to advertise; tests that exercise
+        # publish_now set _max_forward/_max_reverse (or rely on server_update_pairs).
+        self._advertise_liquidity = False
 
     async def run_nostr_server(self):
         self.nostr_started.set()
@@ -62,14 +66,21 @@ class _SwapManager:
             self.nostr_cancelled.set()
             raise
 
+    async def set_nostr_proof_of_work(self):
+        self.pow_calls += 1
+
     def server_update_pairs(self):
         self.pairs_updates += 1
         self.percentage = 0.5
+        if self._advertise_liquidity:
+            self._max_forward = 100000
+            self._max_reverse = 100000
 
 
-def _make_wallet(sm):
+def _make_wallet(sm, *, nostr_keypair=None):
     wallet = mock.MagicMock()
     wallet.lnworker.swap_manager = sm
+    wallet.lnworker.nostr_keypair = nostr_keypair
     wallet.has_password.return_value = False
     return wallet
 
@@ -253,6 +264,80 @@ class RequestPairsUpdateTests(unittest.TestCase):
                 p.request_pairs_update()  # not running -> nothing scheduled
                 time.sleep(0.2)
                 self.assertEqual(sm.pairs_updates, 0)
+
+
+class PublishNowTests(unittest.TestCase):
+    @staticmethod
+    def _fake_transport_cls(published, *, connect=True):
+        class _FakeTransport:
+            def __init__(self, cfg, sm_, keypair):
+                self.connect_timeout = 1
+                self.is_connected = asyncio.Event()
+                if connect:
+                    self.is_connected.set()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def publish_offer(self, sm_):
+                published.set()
+        return _FakeTransport
+
+    def test_start_server_publishes_immediately(self):
+        # Regression: a freshly-started server must announce promptly instead of
+        # waiting for run_nostr_server's first OFFER_UPDATE_INTERVAL_SEC (~10min)
+        # tick, otherwise takers see "no swap providers found" right after boot.
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+        p = _make_plugin(_Config(relays="wss://relay.one"))
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
+        published = threading.Event()
+        with _LoopThread() as loop:
+            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
+                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport",
+                            self._fake_transport_cls(published)):
+                p.start_server()
+                self.assertTrue(published.wait(timeout=5))
+                self.assertGreaterEqual(sm.pow_calls, 1)  # PoW ensured before announce
+                p.stop_server()
+
+    def test_publish_now_waits_for_liquidity(self):
+        # No liquidity yet -> must not announce until server_update_pairs reports
+        # some (mirrors channels being funded shortly after the server starts).
+        sm = _SwapManager()  # _advertise_liquidity stays False initially
+        p = _make_plugin(_Config(relays="wss://relay.one"))
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
+        published = threading.Event()
+        with _LoopThread() as loop:
+            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
+                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport",
+                            self._fake_transport_cls(published)), \
+                 mock.patch.object(SwapServerGuiPlugin, "PUBLISH_NOW_POLL_SEC", 0.05):
+                p.start_server()
+                self.assertFalse(published.wait(timeout=1))  # no liquidity -> no announce
+                sm._advertise_liquidity = True                # channels get funded
+                self.assertTrue(published.wait(timeout=5))    # now it announces
+                p.stop_server()
+
+    def test_publish_now_noop_when_stopped(self):
+        sm = _SwapManager()
+        p = _make_plugin(_Config(relays="wss://relay.one"))
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
+        self.assertIsNone(p.publish_now())  # not running
+
+    def test_publish_now_noop_without_keypair(self):
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+        p = _make_plugin(_Config(relays="wss://relay.one"))
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=None))
+        with _LoopThread() as loop:
+            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop):
+                p.start_server()  # must not spawn a publish without a keypair
+                self.assertIsNone(p._publish_now_fut)
+                p.stop_server()
 
 
 class SummaryTests(unittest.TestCase):
