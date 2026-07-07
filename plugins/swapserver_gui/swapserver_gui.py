@@ -27,6 +27,7 @@ from aiohttp import web
 from electrum.plugin import BasePlugin
 from electrum.util import get_asyncio_loop
 from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED
+from electrum.submarine_swaps import NostrTransport
 
 # Importing the bundled swapserver plugin's server module has the useful side
 # effect of registering the shared config vars (plugins.swapserver.port etc.)
@@ -91,12 +92,20 @@ class SwapServerError(Exception):
 class SwapServerGuiPlugin(BasePlugin):
     """Owns the swap-server lifecycle. The Qt layer subclasses this."""
 
+    # publish_now() waits (bounded) for the server to actually have liquidity to
+    # advertise before announcing. A server that just started may have no open
+    # channels yet (e.g. on a fresh regtest rig the channels are funded shortly
+    # after the server comes up); without this it would announce nothing.
+    PUBLISH_NOW_LIQUIDITY_WAIT_SEC = 180
+    PUBLISH_NOW_POLL_SEC = 3
+
     def __init__(self, parent: Any, config: 'SimpleConfig', name: str) -> None:
         BasePlugin.__init__(self, parent, config, name)
         self.wallet: Optional['Abstract_Wallet'] = None
         self._sm: Optional['SwapManager'] = None
         self._http_fut: Optional['concurrent.futures.Future'] = None
         self._nostr_fut: Optional['concurrent.futures.Future'] = None
+        self._publish_now_fut: Optional['concurrent.futures.Future'] = None
         self._running: bool = False
 
     # ------------------------------------------------------------------ utils
@@ -176,6 +185,90 @@ class SwapServerGuiPlugin(BasePlugin):
         self.logger.info(f"swap server started (http_port={port or None}, "
                           f"nostr_relays={len(relays.split(',')) if relays else 0})")
 
+        # Announce immediately instead of waiting for run_nostr_server's first
+        # OFFER_UPDATE_INTERVAL_SEC (~10 min) tick, so takers can discover us
+        # right after start-up. No-op when no nostr relay is configured.
+        if relays:
+            self.publish_now()
+
+    def publish_now(self) -> Optional['concurrent.futures.Future']:
+        """Force an immediate swap announcement over nostr (non-blocking).
+
+        Safe to call from the Qt GUI thread; returns at once (the work runs on
+        the asyncio loop). Useful both as an explicit "announce now" action and,
+        internally, right after :meth:`start_server` so we don't wait for
+        ``run_nostr_server``'s first ``OFFER_UPDATE_INTERVAL_SEC`` tick. No-op
+        unless the server is running with at least one nostr relay configured.
+        """
+        if not self._running:
+            return None
+        if not (self.config.NOSTR_RELAYS or "").strip():
+            return None
+        if self._sm is None or self.wallet is None or self.wallet.lnworker is None:
+            return None
+        if getattr(self.wallet.lnworker, "nostr_keypair", None) is None:
+            return None
+        self._publish_now_fut = self._spawn(self._one_shot_publish(), "publish-now")
+        return self._publish_now_fut
+
+    async def _one_shot_publish(self) -> None:
+        """Publish a single announcement using a short-lived NostrTransport.
+
+        ``run_nostr_server`` keeps its transport private, so we spin up our own
+        (same pattern as the client's ``get_submarine_swap_providers``) with the
+        server's nostr keypair, wait until there is liquidity to advertise, emit
+        one offer, and tear it down. ``publish_offer`` refuses to announce when
+        there is no liquidity, so we poll ``server_update_pairs`` up to
+        :attr:`PUBLISH_NOW_LIQUIDITY_WAIT_SEC` before giving up.
+        """
+        sm = self._sm
+        if sm is None or self.wallet is None or self.wallet.lnworker is None:
+            return
+        keypair = getattr(self.wallet.lnworker, "nostr_keypair", None)
+        if keypair is None:
+            return
+        # Ensure the announcement carries a valid proof-of-work nonce (reuses a
+        # cached one instantly; only grinds on a brand-new server key).
+        try:
+            await sm.set_nostr_proof_of_work()
+        except Exception:
+            self.logger.debug("set_nostr_proof_of_work failed before publish_now",
+                              exc_info=True)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.PUBLISH_NOW_LIQUIDITY_WAIT_SEC
+        while True:
+            try:
+                sm.server_update_pairs()
+            except Exception:
+                self.logger.debug("server_update_pairs failed in publish_now",
+                                  exc_info=True)
+            min_amount = sm._min_amount or 0
+            have_liquidity = min_amount > 0 and (
+                (sm._max_forward or 0) >= min_amount
+                or (sm._max_reverse or 0) >= min_amount)
+            if have_liquidity:
+                break
+            if loop.time() >= deadline:
+                self.logger.info("publish_now: no liquidity to advertise within "
+                                 f"{self.PUBLISH_NOW_LIQUIDITY_WAIT_SEC}s; skipping")
+                return
+            await asyncio.sleep(self.PUBLISH_NOW_POLL_SEC)
+        transport = NostrTransport(self.config, sm, keypair)
+        try:
+            async with transport:
+                try:
+                    await asyncio.wait_for(transport.is_connected.wait(),
+                                           timeout=transport.connect_timeout + 1)
+                except asyncio.TimeoutError:
+                    self.logger.info("publish_now: no relay connected; "
+                                     "skipping immediate announcement")
+                    return
+                await transport.publish_offer(sm)
+                self.logger.info("publish_now: immediate swap announcement published")
+        except Exception:
+            self.logger.warning("publish_now: immediate announcement failed",
+                                exc_info=True)
+
     def stop_server(self) -> None:
         """Stop all server transports. Idempotent."""
         if not self._running:
@@ -188,8 +281,10 @@ class SwapServerGuiPlugin(BasePlugin):
             sm.http_server = None
         self._cancel_fut(self._http_fut)
         self._cancel_fut(self._nostr_fut)
+        self._cancel_fut(self._publish_now_fut)
         self._http_fut = None
         self._nostr_fut = None
+        self._publish_now_fut = None
         if sm is not None:
             sm.is_server = False
         self._running = False
