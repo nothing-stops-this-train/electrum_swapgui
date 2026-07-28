@@ -27,6 +27,7 @@
 
 import asyncio
 import concurrent.futures
+import importlib
 from typing import TYPE_CHECKING, Optional, List, Dict, Any
 
 from aiohttp import web
@@ -36,7 +37,18 @@ from electrum.util import get_asyncio_loop
 from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED
 from electrum.submarine_swaps import NostrTransport
 
-from . import pow as swap_pow
+# NB: ``from . import pow as swap_pow`` must NOT be used here.  When Electrum
+# loads us as an external *zip* plugin it registers the package in sys.modules
+# under 'electrum_external_plugins.swapserver_gui', but builds its spec from
+# ``zipimport.zipimporter(...).find_spec('swapserver_gui')`` (electrum/plugin.py:
+# maybe_load_plugin_init_method), so the package object's ``__name__`` stays the
+# bare 'swapserver_gui'.  CPython's ``_handle_fromlist`` resolves a submodule
+# fromlist against ``__name__``, not against the sys.modules key, so
+# ``from . import pow`` tries to import 'swapserver_gui.pow' and dies with
+# ModuleNotFoundError: No module named 'swapserver_gui'.
+# ``__package__`` is taken from the submodule's own (correctly dotted) spec, so
+# importing through it works for both the zip and the directory layout.
+swap_pow = importlib.import_module('.pow', __package__)
 
 # Importing the bundled swapserver plugin's server module has the useful side
 # effect of registering the shared config vars (plugins.swapserver.port etc.)
