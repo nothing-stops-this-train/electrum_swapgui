@@ -22,6 +22,11 @@ from electrum.gui.qt.util import read_QIcon
 from .swapserver_gui import (
     SwapServerGuiPlugin, SwapServerError, get_swap_history, get_swap_summary,
 )
+from . import pow as swap_pow
+
+# Above this many bits a proof-of-work grind stops being a "wait a few minutes"
+# affair (see the estimate shown next to the spinbox), so we ask for confirmation.
+POW_TARGET_WARN_ABOVE = 30
 
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
@@ -65,7 +70,7 @@ class SwapServerTab(QWidget):
         body.addWidget(self._build_output_group(), 1)
 
         # ---- periodic refresh --------------------------------------------
-        self._timer = QTimer(self)
+        self._timer: Optional[QTimer] = QTimer(self)
         self._timer.timeout.connect(self.refresh)
         self._timer.start(4000)
 
@@ -98,8 +103,17 @@ class SwapServerTab(QWidget):
 
         self.pow_spin = QSpinBox()
         self.pow_spin.setRange(0, 40)
-        self.pow_spin.setToolTip(_("Proof-of-work target (in bits) for the nostr announcement."))
-        form.addRow(_("Nostr PoW target:"), self.pow_spin)
+        self.pow_spin.setToolTip(_(
+            "Proof-of-work target (in bits) for the nostr announcement.\n"
+            "Each extra bit doubles the expected computation time."))
+        self.pow_est_label = QLabel()
+        self.pow_spin.valueChanged.connect(self._update_pow_estimate)
+        pow_row = QHBoxLayout()
+        pow_row.addWidget(self.pow_spin)
+        pow_row.addWidget(self.pow_est_label)
+        pow_wrap = QWidget()
+        pow_wrap.setLayout(pow_row)
+        form.addRow(_("Nostr PoW target:"), pow_wrap)
 
         self.relays_edit = QPlainTextEdit()
         self.relays_edit.setPlaceholderText("wss://relay.example.com, wss://relay2.example.com")
@@ -122,6 +136,7 @@ class SwapServerTab(QWidget):
         rows = [
             ("http", _("HTTP endpoint:")),
             ("nostr", _("Nostr announcement:")),
+            ("pow", _("Proof of work:")),
             ("percentage", _("Fee percentage:")),
             ("min_amount", _("Min amount:")),
             ("max_forward", _("Max forward (normal):")),
@@ -155,9 +170,26 @@ class SwapServerTab(QWidget):
         self.pow_spin.setValue(int(self.config.SWAPSERVER_POW_TARGET))
         self.relays_edit.setPlainText((self.config.NOSTR_RELAYS or "").replace(",", ",\n"))
         self._update_fee_label()
+        self._update_pow_estimate()
 
     def _update_fee_label(self) -> None:
         self.fee_pct_label.setText("= {:.4f} %".format(self.fee_spin.value() / 10000))
+
+    def _update_pow_estimate(self) -> None:
+        """Show what the selected PoW target actually costs on this machine."""
+        bits = self.pow_spin.value()
+        if bits <= 0:
+            self.pow_est_label.setText(_("disabled"))
+            return
+        try:
+            seconds = swap_pow.estimate_seconds(bits)
+        except Exception:
+            self.pow_est_label.setText("")
+            return
+        text = _("~{} to compute").format(swap_pow.format_duration(seconds))
+        if bits > POW_TARGET_WARN_ABOVE:
+            text = "<span style='color:#c00;'>" + text + "</span>"
+        self.pow_est_label.setText(text)
 
     def _relays_from_widget(self) -> str:
         raw = self.relays_edit.toPlainText().replace("\n", ",")
@@ -167,18 +199,35 @@ class SwapServerTab(QWidget):
     def on_save(self) -> None:
         new_port = self.port_spin.value() or None
         new_relays = self._relays_from_widget()
+        new_pow = self.pow_spin.value()
         old_port = self.config.SWAPSERVER_PORT
         old_relays = self.config.NOSTR_RELAYS or ""
+        old_pow = int(self.config.SWAPSERVER_POW_TARGET or 0)
+
+        # A higher target means the stored nonce no longer qualifies and the
+        # server has to grind a new one, which can take a long time. Make that
+        # explicit rather than silently burning CPU for hours.
+        if new_pow > old_pow and new_pow > POW_TARGET_WARN_ABOVE:
+            est = swap_pow.format_duration(swap_pow.estimate_seconds(new_pow))
+            if not self.window.question(
+                    _("A proof-of-work target of {} bits is expected to take about {} "
+                      "to compute on this machine.").format(new_pow, est) + "\n\n"
+                    + _("The swap server cannot announce over nostr until it finishes. "
+                        "Continue?")):
+                return
+
         # persist
         self.config.SWAPSERVER_PORT = new_port
         self.config.SWAPSERVER_FEE_MILLIONTHS = self.fee_spin.value()
-        self.config.SWAPSERVER_POW_TARGET = self.pow_spin.value()
+        self.config.SWAPSERVER_POW_TARGET = new_pow
         self.config.NOSTR_RELAYS = new_relays
         self.load_settings_into_widgets()
-        # Only a port/relay change needs a server restart; the fee and PoW target
-        # are read live on each request/announcement. Restarting on every save
-        # would needlessly bounce the (busy) nostr transport.
-        transport_changed = (new_port != old_port) or (new_relays != old_relays)
+        # A port/relay change needs a server restart. So does *raising* the PoW
+        # target, since the running server is announcing with a nonce that no
+        # longer meets it. The fee is read live on each request, and lowering the
+        # target keeps the existing nonce valid, so neither needs a bounce.
+        transport_changed = (new_port != old_port) or (new_relays != old_relays) \
+            or (new_pow > old_pow)
         if self.plugin.is_running() and transport_changed:
             self.plugin.stop_server()
             try:
@@ -202,8 +251,21 @@ class SwapServerTab(QWidget):
             self.config.SWAPSERVER_GUI_AUTOSTART = True
         self.refresh()
 
+    # -------------------------------------------------------------- teardown
+    def clean_up(self) -> None:
+        """Stop the periodic refresh. Idempotent; safe to call during shutdown."""
+        if self._timer is not None:
+            self._timer.stop()
+            try:
+                self._timer.timeout.disconnect(self.refresh)
+            except TypeError:
+                pass  # already disconnected
+            self._timer = None
+
     # -------------------------------------------------------------- refresh
     def refresh(self) -> None:
+        if self._timer is None:
+            return  # torn down; the wallet/loop may already be gone
         self.plugin.request_pairs_update()
         st = self.plugin.status()
         running = st["running"]
@@ -228,11 +290,28 @@ class SwapServerTab(QWidget):
 
         if not st["nostr_enabled"]:
             nostr_txt = _("disabled")
+        elif running and st["pow_grinding"]:
+            nostr_txt = _("waiting for proof of work")
         elif running:
             nostr_txt = _("announcing to {} relay(s)").format(st["nostr_relay_count"])
         else:
             nostr_txt = _("{} relay(s) configured").format(st["nostr_relay_count"])
         self._out_labels["nostr"].setText(nostr_txt)
+
+        target = st["pow_target"]
+        if not st["nostr_enabled"] or not target:
+            pow_txt = _("not required")
+        elif st["pow_grinding"]:
+            # There is no meaningful "percent done": each nonce is an independent
+            # trial, so we report scanned hashes and the best result so far.
+            pow_txt = _("computing… best {best}/{target} bits, {hashes} hashes scanned").format(
+                best=st["pow_best_bits"], target=target,
+                hashes=f"{st['pow_hashes_done']:,}")
+        elif st["pow_ready"] and running:
+            pow_txt = _("ready ({} bits)").format(target)
+        else:
+            pow_txt = _("target {} bits").format(target)
+        self._out_labels["pow"].setText(pow_txt)
 
         pct = st["percentage"]
         self._out_labels["percentage"].setText("—" if pct is None else "{:.4f} %".format(pct))
@@ -302,9 +381,14 @@ class Plugin(SwapServerGuiPlugin):
     def _remove_tab(self) -> None:
         if self._tab is None or self._window is None:
             return
+        # Stop the refresh timer first: it calls back into the plugin (and hence
+        # into get_asyncio_loop()) every 4s, and during shutdown the wallet and
+        # the asyncio loop are torn down underneath it.
+        self._tab.clean_up()
         idx = self._window.tabs.indexOf(self._tab)
         if idx != -1:
             self._window.tabs.removeTab(idx)
+        self._tab.deleteLater()
         self._tab = None
         self._window = None
 

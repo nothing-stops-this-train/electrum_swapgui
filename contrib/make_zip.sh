@@ -9,6 +9,7 @@
 #     swapserver_gui/manifest.json
 #     swapserver_gui/__init__.py
 #     swapserver_gui/swapserver_gui.py
+#     swapserver_gui/pow.py
 #     swapserver_gui/qt.py
 #
 # The zip is a plain archive: no signing key or secret is required to build it.
