@@ -52,10 +52,35 @@ jobs:
           cd electrum_swapgui
           python -m unittest discover -s tests -v
 
+      - name: Determine plugin version
+        id: version
+        run: |
+          cd electrum_swapgui
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # The tag is the single source of truth for a release version.
+            version="${GITHUB_REF_NAME#v}"
+            if [ -z "$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME yields an empty version"
+              exit 1
+            fi
+          else
+            # Not a release: stamp a dev marker traceable to the commit, so any
+            # zip handed out from a branch or PR build can be identified.
+            version="dev-g$(git rev-parse --short=7 HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "plugin version: $version"
+
       - name: Build plugin zip
         run: |
           cd electrum_swapgui
-          bash contrib/make_zip.sh "$GITHUB_WORKSPACE/dist"
+          bash contrib/make_zip.sh "$GITHUB_WORKSPACE/dist" "${{ steps.version.outputs.version }}"
+
+      - name: Verify the stamped version
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          unzip -p dist/swapserver_gui.zip swapserver_gui/_version.py \
+            | grep -Fx '__version__ = "${{ steps.version.outputs.version }}"'
 
       - name: Upload plugin zip artifact
         uses: actions/upload-artifact@v4

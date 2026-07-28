@@ -474,6 +474,57 @@ class SwapServerGuiPlugin(BasePlugin):
         return data
 
 
+def save_settings(
+        config: 'SimpleConfig',
+        *,
+        port: int,
+        fee_millionths: int,
+        pow_target: int,
+        relays: str,
+) -> None:
+    """Persist the swap-server settings edited in the GUI.
+
+    Lives here rather than in ``qt.py`` so it can be tested against a real
+    ``SimpleConfig``: PyQt6 is not installed in CI, so anything importable only
+    through ``qt.py`` is effectively untestable.
+
+    ``port`` MUST be an ``int``; ``0`` means "HTTP endpoint disabled".  Passing
+    ``None`` for a disabled port -- the obvious way to express it, since
+    ``SWAPSERVER_PORT`` defaults to ``None`` -- crashes Electrum:
+
+        AttributeError: 'NoneType' object has no attribute 'pop'
+
+    ``SWAPSERVER_PORT`` is registered by Electrum's bundled swapserver plugin as
+    the *dotted* key ``plugins.swapserver.port``
+    (electrum/plugins/swapserver/__init__.py).  Assigning ``None`` to a ConfigVar
+    routes into ``SimpleConfig._set_key_in_user_config``'s key-*deletion* branch,
+    whose recursion walks the dotted path without checking that each intermediate
+    dict exists (electrum/simple_config.py, ``delete_key``)::
+
+        prefix, suffix = key.split('.', 1)
+        d2 = d.get(prefix)          # None when 'plugins.swapserver' was never written
+        empty = delete_key(d2, suffix)
+
+    This plugin only ever writes ``plugins.swapserver_gui.*``, so unless the user
+    has separately enabled and configured the *bundled* swapserver plugin, the
+    ``plugins.swapserver`` sub-dict does not exist and the delete always raises.
+
+    Storing ``0`` takes the ordinary write branch and is behaviourally identical:
+    every reader of the key tests it for truthiness rather than comparing it to
+    ``None`` -- ``electrum/submarine_swaps.py`` (``if self.config.SWAPSERVER_PORT:``),
+    ``electrum/plugins/swapserver/server.py``, and this plugin's own ``can_run``,
+    ``start_server`` and ``status``.
+
+    This is an upstream Electrum bug, but the fix has to live here: users run
+    released AppImages we cannot patch.
+    """
+    assert isinstance(port, int), f"port must be an int, got {port!r}"
+    config.SWAPSERVER_PORT = port
+    config.SWAPSERVER_FEE_MILLIONTHS = int(fee_millionths)
+    config.SWAPSERVER_POW_TARGET = int(pow_target)
+    config.NOSTR_RELAYS = relays
+
+
 def get_swap_history(wallet: 'Abstract_Wallet') -> List[Dict[str, Any]]:
     """Confirmed swaps served by this node (mirrors the bundled swapserver
     plugin's ``get_history`` command, but as a plain sync helper)."""

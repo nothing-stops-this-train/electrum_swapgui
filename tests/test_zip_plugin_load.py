@@ -27,6 +27,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import zipfile
 from typing import List
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -90,11 +91,13 @@ class RelativeImportFormTests(unittest.TestCase):
 class _ZipBuildMixin:
 
     @classmethod
-    def build_zip(cls) -> str:
+    def build_zip(cls, version: str = "") -> str:
         cls._tmpdir = tempfile.TemporaryDirectory()  # noqa: SIM115  (closed in tearDownClass)
+        cmd = ["bash", _MAKE_ZIP, cls._tmpdir.name]
+        if version:
+            cmd.append(version)
         subprocess.run(
-            ["bash", _MAKE_ZIP, cls._tmpdir.name],
-            check=True, capture_output=True, timeout=_SUBPROCESS_TIMEOUT,
+            cmd, check=True, capture_output=True, timeout=_SUBPROCESS_TIMEOUT,
         )
         path = os.path.join(cls._tmpdir.name, "swapserver_gui.zip")
         assert os.path.exists(path), path
@@ -208,6 +211,83 @@ class ExternalZipLoadTests(_ZipBuildMixin, unittest.TestCase):
                 print('OK (executed)')
         """))
         self.assertIn("OK", r.stdout, r.stderr)
+
+
+class VersionStampingTests(_ZipBuildMixin, unittest.TestCase):
+    """End-to-end: the version CI injects must reach the running plugin.
+
+    Covers the whole chain the tab header depends on -- make_zip.sh stamps a
+    staging copy, the stamp lands in the archive, and the module reads back with
+    that value when loaded the way Electrum loads a zip plugin.
+    """
+
+    VERSION = "9.8.7"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.zip_path = cls.build_zip(cls.VERSION)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmpdir.cleanup()
+
+    def test_stamp_lands_in_the_archive(self) -> None:
+        with zipfile.ZipFile(self.zip_path) as zf:
+            source = zf.read("swapserver_gui/_version.py").decode("utf-8")
+        self.assertIn(f'__version__ = "{self.VERSION}"', source)
+        self.assertNotIn('__version__ = "dev"', source)
+
+    def test_working_tree_is_not_modified(self) -> None:
+        """Stamping happens in a staging copy; the committed file stays 'dev'."""
+        with open(os.path.join(_PLUGIN_DIR, "_version.py"), encoding="utf-8") as f:
+            self.assertIn('__version__ = "dev"', f.read())
+
+    def test_version_reads_back_when_loaded_from_zip(self) -> None:
+        r = self.run_child(f"""
+            import importlib.util, os, sys, zipfile, zipimport
+            ZIP = {self.zip_path!r}
+            BASE = {_BASE_NAME!r}
+
+            with zipfile.ZipFile(ZIP) as zf:
+                manifest_name = next(n for n in zf.namelist() if n.endswith('manifest.json'))
+            dirname = os.path.dirname(manifest_name)
+
+            def exec_module_from_spec(spec, path):
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[path] = module
+                spec.loader.exec_module(module)
+                return module
+
+            init_spec = zipimport.zipimporter(ZIP).find_spec(dirname)
+            exec_module_from_spec(init_spec, BASE)
+
+            full = BASE + '._version'
+            mod = exec_module_from_spec(importlib.util.find_spec(full), full)
+            assert mod.__version__ == {self.VERSION!r}, mod.__version__
+            assert mod.format_version(mod.__version__) == 'v{self.VERSION}', mod.__version__
+            print('OK')
+        """)
+        self.assertIn("OK", r.stdout, r.stderr)
+
+    def test_unstamped_build_keeps_the_placeholder(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        subprocess.run(["bash", _MAKE_ZIP, tmpdir.name],
+                       check=True, capture_output=True, timeout=_SUBPROCESS_TIMEOUT)
+        with zipfile.ZipFile(os.path.join(tmpdir.name, "swapserver_gui.zip")) as zf:
+            source = zf.read("swapserver_gui/_version.py").decode("utf-8")
+        self.assertIn('__version__ = "dev"', source)
+
+    def test_unsafe_version_is_rejected(self) -> None:
+        """A malformed tag must fail the build, not emit a broken _version.py."""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        for bad in ('1.0"; import os', "1.0 $(whoami)", "1.0\nx=1"):
+            with self.subTest(version=bad):
+                r = subprocess.run(
+                    ["bash", _MAKE_ZIP, tmpdir.name, bad],
+                    capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
+                self.assertNotEqual(r.returncode, 0, f"accepted unsafe version {bad!r}")
 
 
 class DirectoryLoadTests(_ZipBuildMixin, unittest.TestCase):

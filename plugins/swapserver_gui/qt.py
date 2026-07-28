@@ -22,10 +22,12 @@ from electrum.gui.qt.util import read_QIcon
 
 from .swapserver_gui import (
     SwapServerGuiPlugin, SwapServerError, get_swap_history, get_swap_summary,
+    save_settings,
 )
 # NB: not ``from . import pow as swap_pow`` -- that form breaks when Electrum
 # loads this plugin from a zip.  See the long comment in swapserver_gui.py.
 swap_pow = importlib.import_module('.pow', __package__)
+_version = importlib.import_module('._version', __package__)
 
 # Above this many bits a proof-of-work grind stops being a "wait a few minutes"
 # affair (see the estimate shown next to the spinbox), so we ask for confirmation.
@@ -62,6 +64,15 @@ class SwapServerTab(QWidget):
         self.status_label = QLabel()
         self.status_label.setTextFormat(Qt.TextFormat.RichText)
         header.addWidget(self.status_label, 1)
+        # Which build of the plugin this is. Stamped into the zip at build time
+        # from the git tag, so it matches the GitHub release (see _version.py).
+        self.version_label = QLabel(_version.format_version(_version.__version__))
+        self.version_label.setToolTip(
+            _("Installed version of the Swap Server (GUI) plugin."))
+        self.version_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.version_label.setEnabled(False)  # renders dimmed, like secondary text
+        header.addWidget(self.version_label)
         self.toggle_btn = QPushButton()
         self.toggle_btn.clicked.connect(self.on_toggle)
         header.addWidget(self.toggle_btn)
@@ -200,10 +211,14 @@ class SwapServerTab(QWidget):
         return ",".join(parts)
 
     def on_save(self) -> None:
-        new_port = self.port_spin.value() or None
+        # 0 == "disabled"; never None. Assigning None to SWAPSERVER_PORT crashes
+        # Electrum -- see the docstring of swapserver_gui.save_settings.
+        new_port = self.port_spin.value()
         new_relays = self._relays_from_widget()
         new_pow = self.pow_spin.value()
-        old_port = self.config.SWAPSERVER_PORT
+        # Normalise the old value too: configs written by earlier versions of
+        # this plugin may hold None, which must compare equal to a disabled 0.
+        old_port = int(self.config.SWAPSERVER_PORT or 0)
         old_relays = self.config.NOSTR_RELAYS or ""
         old_pow = int(self.config.SWAPSERVER_POW_TARGET or 0)
 
@@ -219,11 +234,25 @@ class SwapServerTab(QWidget):
                         "Continue?")):
                 return
 
-        # persist
-        self.config.SWAPSERVER_PORT = new_port
-        self.config.SWAPSERVER_FEE_MILLIONTHS = self.fee_spin.value()
-        self.config.SWAPSERVER_POW_TARGET = new_pow
-        self.config.NOSTR_RELAYS = new_relays
+        # persist. A failure here must not escape into the Qt event loop: it
+        # would surface as an unhandled-exception dialog (or just a traceback on
+        # the console) with the user left unsure what, if anything, was saved.
+        try:
+            save_settings(
+                self.config,
+                port=new_port,
+                fee_millionths=self.fee_spin.value(),
+                pow_target=new_pow,
+                relays=new_relays,
+            )
+        except Exception as e:
+            self.plugin.logger.exception("failed to save swap server settings")
+            self.window.show_error(
+                _("Could not save the swap server settings: {}").format(e))
+            # Put the widgets back in sync with what is actually stored, so the
+            # form never claims a value that was not persisted.
+            self.load_settings_into_widgets()
+            return
         self.load_settings_into_widgets()
         # A port/relay change needs a server restart. So does *raising* the PoW
         # target, since the running server is announcing with a nonce that no
