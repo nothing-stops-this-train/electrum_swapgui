@@ -28,14 +28,17 @@
 import asyncio
 import concurrent.futures
 import importlib
-from typing import TYPE_CHECKING, Optional, List, Dict, Any
+import time
+from enum import Enum
+from typing import TYPE_CHECKING, Optional, List, Dict, Any, Tuple
 
 from aiohttp import web
 
+from electrum import constants
 from electrum.plugin import BasePlugin
 from electrum.util import get_asyncio_loop
 from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED
-from electrum.submarine_swaps import NostrTransport
+from electrum.submarine_swaps import NostrTransport, MIN_SWAP_AMOUNT_SAT
 
 # NB: ``from . import pow as swap_pow`` must NOT be used here.  When Electrum
 # loads us as an external *zip* plugin it registers the package in sys.modules
@@ -49,6 +52,7 @@ from electrum.submarine_swaps import NostrTransport
 # ``__package__`` is taken from the submodule's own (correctly dotted) spec, so
 # importing through it works for both the zip and the directory layout.
 swap_pow = importlib.import_module('.pow', __package__)
+nostr_check = importlib.import_module('.nostr_check', __package__)
 
 # Importing the bundled swapserver plugin's server module has the useful side
 # effect of registering the shared config vars (plugins.swapserver.port etc.)
@@ -110,6 +114,86 @@ class SwapServerError(Exception):
     """Raised when the swap server cannot be started with the current settings."""
 
 
+class AnnounceState(Enum):
+    """Why the nostr announcement is (or is not) going out right now.
+
+    The GUI used to say "announcing to N relay(s)" whenever the server was
+    running with relays configured, which is wrong in three common situations
+    that all look identical from the outside -- see :func:`announce_state`.
+    """
+
+    DISABLED = "disabled"            # no relay configured
+    STOPPED = "stopped"              # server not running
+    WAITING_UNLOCK = "waiting_unlock"
+    WAITING_POW = "waiting_pow"
+    NO_LIQUIDITY = "no_liquidity"
+    ANNOUNCING = "announcing"
+
+    @property
+    def is_announcing(self) -> bool:
+        return self is AnnounceState.ANNOUNCING
+
+
+def has_liquidity_to_announce(
+        *,
+        min_amount: Optional[int],
+        max_forward: Optional[int],
+        max_reverse: Optional[int],
+) -> bool:
+    """Mirror ``NostrTransport.publish_offer``'s liquidity gate.
+
+    Upstream (electrum/submarine_swaps.py) bails out with::
+
+        if sm._max_forward < sm._min_amount and sm._max_reverse < sm._min_amount:
+            ... "not publishing swap offer, no liquidity available" ; return
+
+    ``_min_amount`` is ``MIN_SWAP_AMOUNT_SAT`` (20,000 sat) and the maxima come
+    from ``server_update_pairs``: ``max_forward`` is capped by *both* lightning
+    inbound capacity and the on-chain spendable balance, ``max_reverse`` by
+    lightning outbound.  Note that ``server_update_pairs`` also rounds the
+    maxima *down* to two leading digits, so 19,999 sat becomes 19,000.
+
+    A ``None`` anywhere means ``server_update_pairs`` has not run yet; upstream
+    would raise a TypeError on the comparison, which its ``@ignore_exceptions``
+    decorator swallows -- i.e. no announcement either way.
+    """
+    if min_amount is None or max_forward is None or max_reverse is None:
+        return False
+    return max_forward >= min_amount or max_reverse >= min_amount
+
+
+def announce_state(
+        *,
+        running: bool,
+        nostr_enabled: bool,
+        wallet_locked: bool,
+        pow_grinding: bool,
+        min_amount: Optional[int],
+        max_forward: Optional[int],
+        max_reverse: Optional[int],
+) -> AnnounceState:
+    """Classify the announcement path. Pure, so the GUI cannot drift from it.
+
+    The order matches the order in which the real code blocks:
+    ``run_nostr_server`` waits for the wallet password *before* it builds a
+    transport, our ``_nostr_startup`` seeds the proof of work before handing
+    over to it, and ``publish_offer`` checks liquidity last.
+    """
+    if not nostr_enabled:
+        return AnnounceState.DISABLED
+    if not running:
+        return AnnounceState.STOPPED
+    if wallet_locked:
+        return AnnounceState.WAITING_UNLOCK
+    if pow_grinding:
+        return AnnounceState.WAITING_POW
+    if not has_liquidity_to_announce(min_amount=min_amount,
+                                     max_forward=max_forward,
+                                     max_reverse=max_reverse):
+        return AnnounceState.NO_LIQUIDITY
+    return AnnounceState.ANNOUNCING
+
+
 class SwapServerGuiPlugin(BasePlugin):
     """Owns the swap-server lifecycle. The Qt layer subclasses this."""
 
@@ -134,6 +218,14 @@ class SwapServerGuiPlugin(BasePlugin):
         self._pow_gate: asyncio.Event = asyncio.Event()
         self._pow_state: Optional['swap_pow.PowState'] = None
         self._pow_grinding: bool = False
+        # Bookkeeping for the announcements *we* trigger (publish_now). Upstream's
+        # run_nostr_server keeps its transport private and publish_offer is
+        # decorated with @ignore_exceptions, so neither its schedule nor its
+        # success is observable from here -- which is exactly why the Diagnostics
+        # pane asks the relays instead of trusting local state.
+        self._last_publish_attempt_at: Optional[float] = None
+        self._last_publish_note: Optional[str] = None
+        self._check_fut: Optional['concurrent.futures.Future'] = None
 
     # ------------------------------------------------------------------ utils
     @property
@@ -182,6 +274,49 @@ class SwapServerGuiPlugin(BasePlugin):
         if not isinstance(pubkey, (bytes, bytearray)) or len(pubkey) < 2:
             return None
         return bytes(pubkey[1:])
+
+    # ------------------------------------------------------------- identity
+    def nostr_identity(self) -> Optional[Tuple[str, str]]:
+        """``(pubkey_hex, npub)`` for this wallet's nostr key, or None.
+
+        This is the identity takers see and pin as ``SWAPSERVER_NPUB``.  It is
+        derived from the wallet seed (``lnworker.nostr_keypair``), so it exists
+        whether or not the server is running.
+
+        The hex form is x-only -- ``keypair.pubkey.hex()[2:]``, dropping the
+        compressed-key prefix byte -- exactly as ``NostrTransport.nostr_pubkey``
+        computes it, so it matches what the taker's provider list displays.
+        """
+        pubkey = self._nostr_pubkey()
+        if pubkey is None:
+            return None
+        pubkey_hex = pubkey.hex()
+        try:
+            from electrum_aionostr.util import to_nip19
+            npub = to_nip19('npub', pubkey_hex)
+        except Exception:
+            self.logger.debug("could not encode npub", exc_info=True)
+            return None
+        return pubkey_hex, npub
+
+    @staticmethod
+    def nostr_match_fields() -> Dict[str, Any]:
+        """The values a taker's filter must agree with, byte for byte.
+
+        A mismatch in any of these makes the server invisible with no error on
+        either side, so they are worth showing verbatim: the network name
+        distinguishes 'signet' from 'mutinynet', and the event version differs
+        between Electrum releases.
+        """
+        net_name = constants.net.NET_NAME
+        version = NostrTransport.NOSTR_EVENT_VERSION
+        return {
+            "net_name": net_name,
+            "event_version": version,
+            "kind": NostrTransport.USER_STATUS_NIP38,
+            "d_tag": nostr_check.d_tag_for(version),
+            "r_tag": nostr_check.r_tag_for(net_name),
+        }
 
     def _save_pow_state(self, state: 'swap_pow.PowState') -> None:
         self._pow_state = state
@@ -377,6 +512,9 @@ class SwapServerGuiPlugin(BasePlugin):
             if loop.time() >= deadline:
                 self.logger.info("publish_now: no liquidity to advertise within "
                                  f"{self.PUBLISH_NOW_LIQUIDITY_WAIT_SEC}s; skipping")
+                self._last_publish_note = (
+                    f"gave up after {self.PUBLISH_NOW_LIQUIDITY_WAIT_SEC}s: "
+                    f"no liquidity to advertise")
                 return
             await asyncio.sleep(self.PUBLISH_NOW_POLL_SEC)
         transport = NostrTransport(self.config, sm, keypair)
@@ -388,10 +526,17 @@ class SwapServerGuiPlugin(BasePlugin):
                 except asyncio.TimeoutError:
                     self.logger.info("publish_now: no relay connected; "
                                      "skipping immediate announcement")
+                    self._last_publish_note = "no relay connected"
                     return
+                self._last_publish_attempt_at = time.time()
+                # publish_offer is decorated with @ignore_exceptions upstream, so
+                # returning normally is NOT proof that a relay accepted the
+                # event. Only the Diagnostics check can confirm that.
                 await transport.publish_offer(sm)
+                self._last_publish_note = "announcement sent to relays"
                 self.logger.info("publish_now: immediate swap announcement published")
-        except Exception:
+        except Exception as e:
+            self._last_publish_note = f"failed: {type(e).__name__}: {e}"
             self.logger.warning("publish_now: immediate announcement failed",
                                 exc_info=True)
 
@@ -425,6 +570,55 @@ class SwapServerGuiPlugin(BasePlugin):
         self._running = False
         self._pow_grinding = False
         self.logger.info("swap server stopped")
+
+    # ------------------------------------------------------------ diagnostics
+    def wallet_is_locked(self) -> bool:
+        """True while ``run_nostr_server`` would be stuck waiting for a password.
+
+        Upstream loops on exactly this condition before it builds a transport
+        (electrum/submarine_swaps.py, ``run_nostr_server``), so a password-
+        protected wallet that was never unlocked announces nothing at all.
+        """
+        wallet = self.wallet
+        if wallet is None:
+            return False
+        try:
+            return bool(wallet.has_password()) and wallet.get_unlocked_password() is None
+        except Exception:
+            return False
+
+    def relay_list(self) -> List[str]:
+        return [r.strip() for r in (self.config.NOSTR_RELAYS or "").split(",") if r.strip()]
+
+    def check_discoverability(self) -> 'concurrent.futures.Future':
+        """Ask every configured relay whether a taker could see this server.
+
+        Non-blocking: returns a future resolving to a
+        ``nostr_check.DiscoveryReport``.  Safe to call from the Qt GUI thread.
+        Raises :class:`SwapServerError` when there is nothing to check.
+        """
+        identity = self.nostr_identity()
+        if identity is None:
+            raise SwapServerError("this wallet has no nostr key")
+        relays = self.relay_list()
+        if not relays:
+            raise SwapServerError("no nostr relay is configured")
+        pubkey_hex, npub = identity
+        fields = self.nostr_match_fields()
+        network = self._sm.network if self._sm is not None else None
+        coro = nostr_check.run_discovery_check(
+            relays=relays,
+            pubkey_hex=pubkey_hex,
+            npub=npub,
+            net_name=fields["net_name"],
+            event_version=fields["event_version"],
+            kind=fields["kind"],
+            taker_pow_target=int(self.config.SWAPSERVER_POW_TARGET or 0),
+            pow_bits_fn=swap_pow.pow_bits,
+            network=network,
+        )
+        self._check_fut = self._spawn(coro, "discovery-check")
+        return self._check_fut
 
     def request_pairs_update(self) -> None:
         """Ask the swap manager to recompute the advertised pairs (non-blocking)."""
@@ -471,7 +665,61 @@ class SwapServerGuiPlugin(BasePlugin):
             data["max_forward"] = sm._max_forward
             data["max_reverse"] = sm._max_reverse
             data["mining_fee"] = sm.mining_fee
+
+        # ---- nostr identity and announcement diagnostics ------------------
+        identity = self.nostr_identity()
+        data["nostr_pubkey"] = identity[0] if identity else None
+        data["nostr_npub"] = identity[1] if identity else None
+        data.update(self.nostr_match_fields())
+        data["wallet_locked"] = self.wallet_is_locked()
+        data["announce_state"] = announce_state(
+            running=self._running,
+            nostr_enabled=bool(relays),
+            wallet_locked=data["wallet_locked"],
+            pow_grinding=self._pow_grinding,
+            min_amount=data["min_amount"],
+            max_forward=data["max_forward"],
+            max_reverse=data["max_reverse"],
+        )
+        # What the announcement would actually carry, as opposed to the target.
+        pubkey = self._nostr_pubkey()
+        data["pow_bits_achieved"] = (
+            swap_pow.pow_bits(pubkey, self.config.SWAPSERVER_ANN_POW_NONCE)
+            if pubkey is not None else None)
+        data["pow_default_taker_target"] = nostr_check.DEFAULT_TAKER_POW_TARGET
+        data["min_swap_amount"] = MIN_SWAP_AMOUNT_SAT
+        data["last_publish_attempt_at"] = self._last_publish_attempt_at
+        data["last_publish_note"] = self._last_publish_note
         return data
+
+    def announcement_reason(self, st: Optional[Dict[str, Any]] = None) -> str:
+        """One human sentence explaining :attr:`AnnounceState` for the GUI."""
+        if st is None:
+            st = self.status()
+        state = st["announce_state"]
+        if state is AnnounceState.DISABLED:
+            return "No nostr relay is configured, so nothing is announced."
+        if state is AnnounceState.STOPPED:
+            return "The swap server is stopped."
+        if state is AnnounceState.WAITING_UNLOCK:
+            return ("Waiting for the wallet password. Electrum does not start "
+                    "the nostr announcement until the wallet is unlocked.")
+        if state is AnnounceState.WAITING_POW:
+            return ("Computing the announcement proof of work. Nothing is "
+                    "published until it completes.")
+        if state is AnnounceState.NO_LIQUIDITY:
+            min_amount = st.get("min_amount") or st["min_swap_amount"]
+            return (f"Not announcing: no liquidity to advertise. A swap offer is "
+                    f"only published when max forward or max reverse reaches "
+                    f"{min_amount:,} sat. Max forward is capped by lightning "
+                    f"inbound capacity AND the on-chain balance; max reverse by "
+                    f"lightning outbound capacity.")
+        return ("Announcing. Use the discoverability check below to confirm the "
+                "relays are actually serving the offer to takers.")
+
+    def cancel_discovery_check(self) -> None:
+        self._cancel_fut(self._check_fut)
+        self._check_fut = None
 
 
 def save_settings(

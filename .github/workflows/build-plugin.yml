@@ -44,10 +44,18 @@ jobs:
           # electrum/crypto.py requires one of these (normally pulled in
           # transitively via the dnspython[DNSSEC] extra); install explicitly.
           pip install aiohttp cryptography
+          # PyQt6 so tests/test_qt_tab.py actually runs instead of skipping.
+          # It renders through the offscreen QPA platform, so no display is
+          # needed, but Qt still links against these X libs on ubuntu-latest.
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0
+          pip install PyQt6
 
       - name: Run unit tests
         env:
           ELECTRUM_SRC: ${{ github.workspace }}/electrum
+          QT_QPA_PLATFORM: offscreen
         run: |
           cd electrum_swapgui
           python -m unittest discover -s tests -v

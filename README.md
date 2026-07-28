@@ -11,9 +11,14 @@ From the tab you can:
 - **Enable / disable** the swap server at runtime.
 - **Edit every server setting**: HTTP port, swap fee, nostr relays, and the
   nostr announcement proof-of-work target.
-- **Watch live output**: the advertised pairs (min / max-forward / max-reverse /
-  mining fee / fee %), your lightning send/receive liquidity, and the history &
-  running P/L of swaps this node has served.
+- **Watch live output**, split into two sub-tabs:
+  - **Status** — your nostr pubkey (npub, with the identicon takers see), the
+    advertised pairs (min / max-forward / max-reverse / mining fee / fee %),
+    your lightning send/receive liquidity, and the history & running P/L of
+    swaps this node has served.
+  - **Diagnostics** — why the offer is or is not going out, the three values a
+    taker's filter must match, and a one-click **discoverability check**. See
+    [Why can nobody see my swap server?](#why-can-nobody-see-my-swap-server)
 
 The server runs two independent transports (either or both):
 
@@ -35,6 +40,55 @@ tasks are never spawned by Electrum itself in the GUI; the plugin starts/stops
 them on the network asyncio loop and keeps the aiohttp `AppRunner` so the HTTP
 listener can be shut down cleanly (`swapserver_gui.py:ManagedHttpSwapServer`).
 
+## Why can nobody see my swap server?
+
+A swap server can be running, connected, and grinding a perfectly valid proof of
+work and still be **completely invisible**, because every rejection on the taker
+side is silent — `NostrTransport._get_pairs_loop` in
+`electrum/submarine_swaps.py` drops a candidate offer with at most a `debug` log
+line. The **Diagnostics** sub-tab exists to make that legible.
+
+A taker only considers an offer when *all* of these line up:
+
+| What | Server side | Taker side |
+| --- | --- | --- |
+| event kind | `USER_STATUS_NIP38` = `30315` | same |
+| `d` tag | `electrum-swapserver-<NOSTR_EVENT_VERSION>` | same — **differs between Electrum versions** |
+| `r` tag | `net:<constants.net.NET_NAME>` | same — note `signet` ≠ `mutinynet` |
+| `created_at` | now | within ±1 h of the taker's clock |
+| proof of work | ground to *your* `SWAPSERVER_POW_TARGET` | at least the *taker's* `SWAPSERVER_POW_TARGET` (**default 30**) |
+
+Ranked causes, most common first:
+
+1. **Nothing was ever published — no liquidity.** `publish_offer` returns early
+   unless `max_forward` or `max_reverse` reaches `MIN_SWAP_AMOUNT_SAT`
+   (20,000 sat). `max_forward` is capped by *both* your lightning inbound
+   capacity and your on-chain spendable balance; `max_reverse` by lightning
+   outbound. `server_update_pairs` also rounds both *down* to two leading
+   digits, so 19,999 sat becomes 19,000. The Status tab no longer claims to be
+   "announcing" in this state.
+2. **Proof-of-work asymmetry.** `SWAPSERVER_POW_TARGET` means "bits to grind"
+   on the server but "bits I demand" on the taker. Lower it to save CPU and
+   every taker still on the default of 30 drops you. The Diagnostics tab warns
+   whenever the announcement carries fewer than 30 bits.
+3. **Network mismatch.** `signet` and `mutinynet` are separate `NET_NAME`s
+   upstream; the `r` tag never matches across them.
+4. **Electrum version skew** between the two wallets, via the `d` tag.
+5. **The taker is not using nostr at all** — a non-empty `SWAPSERVER_URL` makes
+   it build an `HttpTransport`, and a wallet that is itself a server never runs
+   the discovery loop.
+6. **Relay-side expiry.** Announcements carry a NIP-40 `expiration` of ~10
+   minutes and are republished every 10 minutes, so a server that has been down
+   for longer has no stored offer left. Some public relays also silently refuse
+   kind `30315`.
+
+**Check discoverability** asks each configured relay the taker's own question,
+using a throwaway key, and names the first rule that rejects you — per relay,
+so "found on 2 of 9" is visible. It runs two queries: one by author (does our
+announcement exist here at all?) and one with the taker's verbatim filter (does
+it survive it?). That split is what distinguishes a wrong tag from a missing
+event from being crowded out of a busy relay's 10-result page.
+
 ## Layout
 
 ```
@@ -43,8 +97,10 @@ plugins/swapserver_gui/
   __init__.py          # registers plugins.swapserver_gui.autostart
   _version.py          # plugin version, stamped from the git tag at build time
   swapserver_gui.py    # GUI-agnostic server lifecycle + history helpers
+  pow.py               # cancel-safe, resumable announcement proof-of-work
+  nostr_check.py       # nostr identity + the discoverability rule engine/check
   qt.py                # the "Swap Server" tab + Plugin(load_wallet/close_wallet)
-tests/                 # unit + HTTP end-to-end tests (no GUI needed)
+tests/                 # unit + HTTP/nostr/Qt end-to-end tests
 contrib/make_zip.sh    # build the external-plugin zip
 contrib/regtest_demo/  # one-command local regtest + nostr demo
 ```
@@ -107,6 +163,19 @@ ELECTRUM_SRC=/path/to/electrum python3 -m unittest discover -s tests -v
   `SimpleConfig`, including disabling the HTTP port (see the note below).
 - `tests/test_version.py` / `tests/test_zip_plugin_load.py` — version formatting
   and the end-to-end build-time stamping chain.
+- `tests/test_nostr_check.py` — the discoverability rule engine, pinned to the
+  order of checks `_get_pairs_loop` performs, so the field we blame is the one
+  that actually rejects us upstream.
+- `tests/test_diagnostics.py` — the announcement state machine, the liquidity
+  gate (`publish_offer`'s early return), and the npub shown in the Status tab.
+- `tests/test_discovery_e2e.py` — the check driven against a **real** NIP-01
+  relay hosted in-process (`tests/fake_relay.py`, aiohttp WebSocket): offers are
+  published with `electrum_aionostr` exactly as the server does, signatures are
+  verified on receipt, and each failure mode (low PoW, wrong net, wrong version,
+  crowded out, unreachable) is asserted to be named correctly.
+- `tests/test_qt_tab.py` — builds the real `SwapServerTab` on Qt's offscreen
+  platform and drives `refresh()`. **Skips when PyQt6 is not installed**; CI
+  installs it so these run there.
 
 ### A note on the HTTP port
 

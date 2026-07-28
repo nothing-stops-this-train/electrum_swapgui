@@ -7,26 +7,28 @@
 # controls to the transport lifecycle implemented in ``swapserver_gui.py``.
 
 import importlib
-from typing import TYPE_CHECKING, Optional, Dict, Any
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QTimer
+import time
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QGroupBox,
     QLabel, QPushButton, QSpinBox, QPlainTextEdit, QTreeWidget, QTreeWidgetItem,
-    QSizePolicy,
+    QSizePolicy, QTabWidget,
 )
 
 from electrum.i18n import _
 from electrum.plugin import hook
-from electrum.gui.qt.util import read_QIcon
+from electrum.gui.qt.util import read_QIcon, pubkey_to_q_icon, WWLabel, ColorScheme
 
 from .swapserver_gui import (
-    SwapServerGuiPlugin, SwapServerError, get_swap_history, get_swap_summary,
-    save_settings,
+    SwapServerGuiPlugin, SwapServerError, AnnounceState, get_swap_history,
+    get_swap_summary, save_settings,
 )
 # NB: not ``from . import pow as swap_pow`` -- that form breaks when Electrum
 # loads this plugin from a zip.  See the long comment in swapserver_gui.py.
 swap_pow = importlib.import_module('.pow', __package__)
+nostr_check = importlib.import_module('.nostr_check', __package__)
 _version = importlib.import_module('._version', __package__)
 
 # Above this many bits a proof-of-work grind stops being a "wait a few minutes"
@@ -50,12 +52,20 @@ def _fmt_sat(config, sat: Optional[int]) -> str:
 class SwapServerTab(QWidget):
     """The 'Swap Server' tab: enable/disable, settings, and live output."""
 
+    # The discoverability check completes on the asyncio thread; this hops the
+    # report (or the exception) back onto the GUI thread before touching widgets.
+    checkFinished = pyqtSignal(object)
+
     def __init__(self, plugin: 'Plugin', window: 'ElectrumWindow') -> None:
         QWidget.__init__(self)
         self.plugin = plugin
         self.window = window
         self.config = plugin.config
         self.wallet = window.wallet
+        self._npub: Optional[str] = None
+        self._check_running: bool = False
+        self._alive: List[bool] = [True]  # cleared by clean_up(); see on_check_discoverability
+        self.checkFinished.connect(self.on_check_finished)
 
         root = QVBoxLayout(self)
 
@@ -142,8 +152,45 @@ class SwapServerTab(QWidget):
         return box
 
     def _build_output_group(self) -> QGroupBox:
+        """The right-hand pane: a Status/Diagnostics tab pair.
+
+        The settings box deliberately stays outside these tabs so it is
+        reachable from both.
+        """
         box = QGroupBox(_("Live output"))
         outer = QVBoxLayout(box)
+        self.output_tabs = QTabWidget()
+        self.output_tabs.addTab(self._build_status_tab(), _("Status"))
+        self.output_tabs.addTab(self._build_diagnostics_tab(), _("Diagnostics"))
+        outer.addWidget(self.output_tabs)
+        return box
+
+    def _build_status_tab(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+
+        # ---- nostr identity ------------------------------------------------
+        # This is what a taker pins as SWAPSERVER_NPUB, so it belongs with the
+        # operator-facing status rather than with the diagnostics.
+        ident_box = QGroupBox(_("Nostr identity"))
+        ident_layout = QHBoxLayout(ident_box)
+        self.npub_icon = QLabel()
+        self.npub_icon.setFixedWidth(18)
+        self.npub_icon.setToolTip(
+            _("Identicon takers see next to this server in their provider list."))
+        ident_layout.addWidget(self.npub_icon)
+        self.npub_label = QLabel("—")
+        self.npub_label.setWordWrap(True)
+        self.npub_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.npub_label.setToolTip(
+            _("The nostr public key this swap server announces under.\n"
+              "Give it to a taker to select this server directly."))
+        ident_layout.addWidget(self.npub_label, 1)
+        self.npub_copy_btn = QPushButton(_("Copy"))
+        self.npub_copy_btn.clicked.connect(self.on_copy_npub)
+        ident_layout.addWidget(self.npub_copy_btn)
+        outer.addWidget(ident_box)
 
         grid = QGridLayout()
         self._out_labels: Dict[str, QLabel] = {}
@@ -175,7 +222,77 @@ class SwapServerTab(QWidget):
         self.history_tree.setRootIsDecorated(False)
         outer.addWidget(self.history_tree, 1)
 
-        return box
+        return page
+
+    def _build_diagnostics_tab(self) -> QWidget:
+        """Everything needed to answer "why can nobody see my server?".
+
+        Each rejection on the taker side is silent (see nostr_check.py), so this
+        pane spells out the values that have to match and then goes and asks the
+        relays directly.
+        """
+        page = QWidget()
+        outer = QVBoxLayout(page)
+
+        # ---- announcement state -------------------------------------------
+        ann_box = QGroupBox(_("Announcement"))
+        ann_layout = QVBoxLayout(ann_box)
+        self.announce_label = QLabel("—")
+        self.announce_label.setTextFormat(Qt.TextFormat.RichText)
+        ann_layout.addWidget(self.announce_label)
+        self.announce_reason = WWLabel("")
+        ann_layout.addWidget(self.announce_reason)
+        self.last_publish_label = QLabel("")
+        self.last_publish_label.setEnabled(False)
+        ann_layout.addWidget(self.last_publish_label)
+        outer.addWidget(ann_box)
+
+        # ---- the fields a taker's filter must agree with --------------------
+        match_box = QGroupBox(_("Taker must match"))
+        match_box.setToolTip(_(
+            "A taker only considers an offer when all of these are identical on "
+            "both sides. Mismatches are discarded silently by both wallets."))
+        match_form = QFormLayout(match_box)
+        self._match_labels: Dict[str, QLabel] = {}
+        for key, text in (("net", _("Network:")),
+                          ("version", _("Event version:")),
+                          ("kind", _("Event kind:")),
+                          ("pow", _("Proof of work:"))):
+            val = QLabel("—")
+            val.setTextFormat(Qt.TextFormat.RichText)
+            val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self._match_labels[key] = val
+            match_form.addRow(text, val)
+        self.pow_warning = WWLabel("")
+        self.pow_warning.setVisible(False)
+        match_form.addRow(self.pow_warning)
+        outer.addWidget(match_box)
+
+        # ---- the self-check ------------------------------------------------
+        check_box = QGroupBox(_("Discoverability check"))
+        check_layout = QVBoxLayout(check_box)
+        check_row = QHBoxLayout()
+        self.check_btn = QPushButton(_("Check discoverability"))
+        self.check_btn.setToolTip(_(
+            "Query each configured relay the way another wallet would, and "
+            "report whether this server's offer comes back."))
+        self.check_btn.clicked.connect(self.on_check_discoverability)
+        check_row.addWidget(self.check_btn)
+        self.check_headline = QLabel("")
+        check_row.addWidget(self.check_headline, 1)
+        check_layout.addLayout(check_row)
+
+        self.check_tree = QTreeWidget()
+        self.check_tree.setHeaderLabels([_("Relay"), _("Result"), _("Detail")])
+        self.check_tree.setRootIsDecorated(False)
+        check_layout.addWidget(self.check_tree, 1)
+
+        self.check_warnings = WWLabel("")
+        self.check_warnings.setVisible(False)
+        check_layout.addWidget(self.check_warnings)
+        outer.addWidget(check_box, 1)
+
+        return page
 
     # ------------------------------------------------------------- settings
     def load_settings_into_widgets(self) -> None:
@@ -283,9 +400,87 @@ class SwapServerTab(QWidget):
             self.config.SWAPSERVER_GUI_AUTOSTART = True
         self.refresh()
 
+    def on_copy_npub(self) -> None:
+        if not self._npub:
+            return
+        self.window.do_copy(self._npub, title=_("Nostr pubkey"))
+
+    # ---------------------------------------------------------- diagnostics
+    def on_check_discoverability(self) -> None:
+        if self._check_running:
+            return
+        try:
+            fut = self.plugin.check_discoverability()
+        except SwapServerError as e:
+            self.window.show_error(str(e))
+            return
+        except Exception as e:  # e.g. the asyncio loop is gone
+            self.plugin.logger.exception("could not start the discoverability check")
+            self.window.show_error(
+                _("Could not run the discoverability check: {}").format(e))
+            return
+        self._check_running = True
+        self.check_btn.setEnabled(False)
+        self.check_btn.setText(_("Checking…"))
+        self.check_headline.setText(_("Querying relays…"))
+        self.check_tree.clear()
+        self.check_warnings.setVisible(False)
+
+        # A plain list, not a widget attribute: clean_up() flips it so a check
+        # that lands *while* the tab is being torn down never emits into a
+        # deleted QObject (the timer is stopped by then, but this future is not
+        # driven by it).
+        alive = self._alive
+
+        def _done(f) -> None:
+            # runs on the asyncio thread: emit only, never touch widgets here
+            if f.cancelled() or not alive[0]:
+                return
+            try:
+                result = f.result()
+            except Exception as e:  # noqa: BLE001 - surfaced to the user below
+                result = e
+            try:
+                self.checkFinished.emit(result)
+            except RuntimeError:
+                pass  # the tab was deleted between the guard and the emit
+        fut.add_done_callback(_done)
+
+    def on_check_finished(self, report: Any) -> None:
+        self._check_running = False
+        self.check_btn.setEnabled(True)
+        self.check_btn.setText(_("Check discoverability"))
+        if isinstance(report, BaseException):
+            self.check_headline.setText(_("Check failed."))
+            self.window.show_error(
+                _("Could not run the discoverability check: {}").format(report))
+            return
+        self.check_headline.setText(report.headline())
+        self.check_tree.clear()
+        for result in report.results:
+            item = QTreeWidgetItem([
+                result.relay,
+                _("discoverable") if result.is_ok else result.status.value.replace("_", " "),
+                result.detail,
+            ])
+            colour = ColorScheme.GREEN if result.is_ok else ColorScheme.RED
+            item.setForeground(1, colour.as_color())
+            self.check_tree.addTopLevelItem(item)
+        for i in range(3):
+            self.check_tree.resizeColumnToContents(i)
+        warnings = report.warnings()
+        if warnings:
+            self.check_warnings.setText("⚠ " + "\n\n⚠ ".join(warnings))
+            self.check_warnings.setVisible(True)
+        else:
+            self.check_warnings.setVisible(False)
+
     # -------------------------------------------------------------- teardown
     def clean_up(self) -> None:
         """Stop the periodic refresh. Idempotent; safe to call during shutdown."""
+        self._alive[0] = False
+        self.plugin.cancel_discovery_check()
+        self._check_running = False
         if self._timer is not None:
             self._timer.stop()
             try:
@@ -320,14 +515,20 @@ class SwapServerTab(QWidget):
             http_txt = _("configured (port {})").format(st["http_port"])
         self._out_labels["http"].setText(http_txt)
 
-        if not st["nostr_enabled"]:
-            nostr_txt = _("disabled")
-        elif running and st["pow_grinding"]:
-            nostr_txt = _("waiting for proof of work")
-        elif running:
-            nostr_txt = _("announcing to {} relay(s)").format(st["nostr_relay_count"])
-        else:
-            nostr_txt = _("{} relay(s) configured").format(st["nostr_relay_count"])
+        # Never claim we are announcing when the announcement path is blocked:
+        # a locked wallet, an unfinished proof of work and (most commonly) too
+        # little liquidity all suppress publish_offer silently. See
+        # swapserver_gui.announce_state.
+        state = st["announce_state"]
+        nostr_txt = {
+            AnnounceState.DISABLED: _("disabled"),
+            AnnounceState.STOPPED: _("{} relay(s) configured").format(st["nostr_relay_count"]),
+            AnnounceState.WAITING_UNLOCK: _("waiting for wallet unlock"),
+            AnnounceState.WAITING_POW: _("waiting for proof of work"),
+            AnnounceState.NO_LIQUIDITY: _("not announcing — no liquidity"),
+            AnnounceState.ANNOUNCING: _("announcing to {} relay(s)").format(st["nostr_relay_count"]),
+            # a state added later must degrade, not crash the 4s refresh
+        }.get(state, state.value.replace("_", " "))
         self._out_labels["nostr"].setText(nostr_txt)
 
         target = st["pow_target"]
@@ -360,7 +561,73 @@ class SwapServerTab(QWidget):
             except Exception:
                 pass
 
+        self._refresh_identity(st)
+        self._refresh_diagnostics(st)
         self._refresh_history()
+
+    def _refresh_identity(self, st: Dict[str, Any]) -> None:
+        npub = st["nostr_npub"]
+        pubkey = st["nostr_pubkey"]
+        self._npub = npub
+        self.npub_copy_btn.setEnabled(bool(npub))
+        if not npub or not pubkey:
+            self.npub_label.setText(_("no nostr key (wallet has no lightning)"))
+            self.npub_icon.clear()
+            self.npub_label.setToolTip("")
+            return
+        self.npub_label.setText(npub)
+        self.npub_label.setToolTip(_("hex: {}").format(pubkey))
+        self.npub_icon.setPixmap(pubkey_to_q_icon(pubkey).pixmap(16, 16))
+
+    def _refresh_diagnostics(self, st: Dict[str, Any]) -> None:
+        state = st["announce_state"]
+        if state is AnnounceState.ANNOUNCING:
+            self.announce_label.setText("<b>" + _("Announcing") + "</b>")
+        else:
+            self.announce_label.setText(
+                "<b>" + _("Not announcing") + "</b> — " + state.value.replace("_", " "))
+        self.announce_reason.setText(self.plugin.announcement_reason(st))
+
+        attempt = st["last_publish_attempt_at"]
+        note = st["last_publish_note"]
+        if attempt is None and not note:
+            self.last_publish_label.setText(
+                _("This plugin has not tried to announce yet in this session."))
+        else:
+            parts = []
+            if attempt is not None:
+                parts.append(_("Last announcement attempt by this plugin: {} ago").format(
+                    nostr_check.format_age(int(time.time() - attempt))))
+            if note:
+                parts.append(str(note))
+            self.last_publish_label.setText(" · ".join(parts))
+
+        self._match_labels["net"].setText(st["r_tag"])
+        self._match_labels["version"].setText(st["d_tag"])
+        self._match_labels["kind"].setText(str(st["kind"]))
+
+        achieved = st["pow_bits_achieved"]
+        target = st["pow_target"]
+        default_target = st["pow_default_taker_target"]
+        if achieved is None:
+            self._match_labels["pow"].setText("—")
+        else:
+            txt = _("{} bits (this wallet's target: {})").format(achieved, target)
+            if achieved < default_target:
+                txt = "<span style='color:#c00;'>" + txt + "</span>"
+            self._match_labels["pow"].setText(txt)
+        # The single most common silent failure: SWAPSERVER_POW_TARGET means
+        # "bits to grind" here but "bits I demand" on the taker, so announcing
+        # below Electrum's default makes us invisible to stock wallets.
+        if achieved is not None and achieved < default_target:
+            self.pow_warning.setText(_(
+                "Takers using Electrum's default proof-of-work target of {default} "
+                "will silently ignore this server, because the announcement only "
+                "carries {achieved} bits. Raise 'Nostr PoW target' to {default} "
+                "and restart the server.").format(default=default_target, achieved=achieved))
+            self.pow_warning.setVisible(True)
+        else:
+            self.pow_warning.setVisible(False)
 
     def _refresh_history(self) -> None:
         try:

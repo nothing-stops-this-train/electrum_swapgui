@@ -180,7 +180,7 @@ class ExternalZipLoadTests(_ZipBuildMixin, unittest.TestCase):
     def test_non_gui_submodules_import_from_zip(self) -> None:
         """The regression test: this is the import that crashed the install."""
         r = self.run_child(self._loader("""
-            for sub in ('pow', 'swapserver_gui'):
+            for sub in ('pow', 'nostr_check', 'swapserver_gui'):
                 full = BASE + '.' + sub
                 spec = importlib.util.find_spec(full)
                 assert spec is not None, full
@@ -189,6 +189,8 @@ class ExternalZipLoadTests(_ZipBuildMixin, unittest.TestCase):
             # the module handle must be the *same* module object, not a re-import
             assert core.swap_pow is sys.modules[BASE + '.pow'], core.swap_pow
             assert core.swap_pow.pow_bits(bytes(32), 1) >= 0
+            assert core.nostr_check is sys.modules[BASE + '.nostr_check'], core.nostr_check
+            assert core.nostr_check.d_tag_for(5) == 'electrum-swapserver-5'
             print('OK')
         """))
         self.assertIn("OK", r.stdout, r.stderr)
@@ -207,6 +209,7 @@ class ExternalZipLoadTests(_ZipBuildMixin, unittest.TestCase):
             else:
                 mod = exec_module_from_spec(spec, full)
                 assert mod.swap_pow is sys.modules[BASE + '.pow']
+                assert mod.nostr_check is sys.modules[BASE + '.nostr_check']
                 assert issubclass(mod.Plugin, sys.modules[BASE + '.swapserver_gui'].SwapServerGuiPlugin)
                 print('OK (executed)')
         """))
