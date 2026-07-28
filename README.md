@@ -12,10 +12,11 @@ From the tab you can:
 - **Edit every server setting**: HTTP port, swap fee, nostr relays, and the
   nostr announcement proof-of-work target.
 - **Watch live output**, split into two sub-tabs:
-  - **Status** — your nostr pubkey (npub, with the identicon takers see), the
-    advertised pairs (min / max-forward / max-reverse / mining fee / fee %),
-    your lightning send/receive liquidity, and the history & running P/L of
-    swaps this node has served.
+  - **Status** — your nostr pubkey in **both** encodings (npub and hex, each
+    copyable, with the identicon takers see), the advertised pairs (min /
+    max-forward / max-reverse / mining fee / fee %), your lightning
+    send/receive liquidity, and the history & running P/L of swaps this node
+    has served.
   - **Diagnostics** — why the offer is or is not going out, the three values a
     taker's filter must match, and a one-click **discoverability check**. See
     [Why can nobody see my swap server?](#why-can-nobody-see-my-swap-server)
@@ -39,6 +40,24 @@ Because Electrum starts the swap manager with `is_server = False`, the server
 tasks are never spawned by Electrum itself in the GUI; the plugin starts/stops
 them on the network asyncio loop and keeps the aiohttp `AppRunner` so the HTTP
 listener can be shut down cleanly (`swapserver_gui.py:ManagedHttpSwapServer`).
+
+## npub or hex?
+
+The tab shows the server's key in both forms because the two places you meet it
+disagree, and they look nothing alike:
+
+| Where | Encoding |
+| --- | --- |
+| Swap Server tab | npub **and** hex |
+| Electrum's *Choose Swap Provider* dialog, **Pubkey** column | hex only |
+| `SWAPSERVER_NPUB` (what a taker pins) | npub |
+
+`swap_dialog.py` renders `SwapOffer.server_pubkey` — the raw hex `event.pubkey`
+— and keeps the npub only as hidden item data. Same key, two encodings.
+
+The quickest visual check that a provider entry is your server is the
+**identicon**: both sides derive it from the *hex* via `pubkey_to_q_icon`, so
+the coloured square matches.
 
 ## Why can nobody see my swap server?
 

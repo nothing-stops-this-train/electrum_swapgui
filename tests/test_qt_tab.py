@@ -71,6 +71,7 @@ class _SwapManager:
         self._max_forward = 0
         self._max_reverse = 0
         self.mining_fee = 1000
+        self._swaps = {}  # read by get_swap_history via the history refresh
 
     def server_update_pairs(self):
         pass
@@ -129,14 +130,34 @@ class QtTabTests(unittest.TestCase):
         self.assertTrue(status.isAncestorOf(tab.npub_label))
 
     # ------------------------------------------------------------- identity
-    def test_npub_is_shown_with_hex_tooltip_and_identicon(self):
+    def test_both_encodings_are_shown_with_the_identicon(self):
+        """npub AND hex: the provider list shows hex, SWAPSERVER_NPUB is npub,
+        and showing only one reads as the GUI displaying the wrong key."""
         tab, plugin, _, _ = self._make_tab()
         expected_hex, expected_npub = plugin.nostr_identity()
         self.assertEqual(tab.npub_label.text(), expected_npub)
         self.assertTrue(tab.npub_label.text().startswith("npub1"))
-        self.assertIn(expected_hex, tab.npub_label.toolTip())
+        self.assertEqual(tab.pubkey_hex_label.text(), expected_hex)
         self.assertFalse(tab.npub_icon.pixmap().isNull())
         self.assertTrue(tab.npub_copy_btn.isEnabled())
+        self.assertTrue(tab.pubkey_hex_copy_btn.isEnabled())
+
+    def test_the_two_encodings_are_the_same_key(self):
+        """Guards the actual confusion: they must never drift apart."""
+        from electrum_aionostr.util import from_nip19
+        tab, _, _, _ = self._make_tab()
+        shown_npub = tab.npub_label.text()
+        shown_hex = tab.pubkey_hex_label.text()
+        self.assertEqual(from_nip19(shown_npub)['object'].hex(), shown_hex)
+        # and the hex is exactly what SwapOffer.server_pubkey would carry:
+        # NostrTransport.nostr_pubkey == keypair.pubkey.hex()[2:]
+        self.assertEqual(shown_hex, PUBKEY_33.hex()[2:])
+
+    def test_hex_copy_button_copies_the_hex(self):
+        tab, plugin, _, window = self._make_tab()
+        tab.on_copy_pubkey_hex()
+        window.do_copy.assert_called_once()
+        self.assertEqual(window.do_copy.call_args[0][0], plugin.nostr_identity()[0])
 
     def test_identity_is_shown_while_the_server_is_stopped(self):
         # the key is seed-derived; an operator must be able to read it before
@@ -153,8 +174,26 @@ class QtTabTests(unittest.TestCase):
 
     def test_wallet_without_nostr_key_degrades_gracefully(self):
         tab, _, _, _ = self._make_tab(keypair=None)
-        self.assertNotIn("npub", tab.npub_label.text())
+        self.assertNotIn("npub1", tab.npub_label.text())
+        self.assertEqual(tab.pubkey_hex_label.text(), "—")
         self.assertFalse(tab.npub_copy_btn.isEnabled())
+        self.assertFalse(tab.pubkey_hex_copy_btn.isEnabled())
+        # copying must be a no-op rather than pasting an empty string
+        tab.on_copy_npub()
+        tab.on_copy_pubkey_hex()
+
+    def test_identicon_uses_the_hex_like_the_provider_list_does(self):
+        """swap_dialog.py feeds x.server_pubkey (hex) to pubkey_to_q_icon; if we
+        fed it the npub the colours would differ and the visual check would lie."""
+        from electrum.gui.qt.util import pubkey_to_q_icon
+        tab, plugin, _, _ = self._make_tab()
+        pubkey_hex, npub = plugin.nostr_identity()
+        expected = pubkey_to_q_icon(pubkey_hex).pixmap(16, 16).toImage()
+        self.assertEqual(tab.npub_icon.pixmap().toImage(), expected)
+        # upstream's colour helper only accepts the 64-char hex, so feeding it
+        # the npub is not merely a different colour -- it is a hard error
+        with self.assertRaises(AssertionError):
+            pubkey_to_q_icon(npub)
 
     # --------------------------------------------------------- announcement
     def test_running_without_liquidity_does_not_claim_to_announce(self):
