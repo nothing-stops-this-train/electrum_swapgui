@@ -77,6 +77,11 @@ class _SwapManager:
             self._max_reverse = 100000
 
 
+async def _never_finishing_pow(self):
+    """Stand-in for ensure_pow_nonce that never opens the gate (still cancellable)."""
+    await asyncio.Event().wait()
+
+
 def _make_wallet(sm, *, nostr_keypair=None):
     wallet = mock.MagicMock()
     wallet.lnworker.swap_manager = sm
@@ -100,6 +105,14 @@ class _LoopThread:
         return self.loop
 
     def __exit__(self, *exc):
+        # Let cancelled tasks unwind before the loop goes away, otherwise
+        # asyncio logs "Task was destroyed but it is pending". Draining via a
+        # probe (rather than a fixed sleep) also covers tests that deliberately
+        # keep the loop busy for a while.
+        try:
+            asyncio.run_coroutine_threadsafe(asyncio.sleep(0.1), self.loop).result(timeout=5)
+        except Exception:
+            pass
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(timeout=5)
         self.loop.close()
@@ -301,7 +314,47 @@ class PublishNowTests(unittest.TestCase):
                             self._fake_transport_cls(published)):
                 p.start_server()
                 self.assertTrue(published.wait(timeout=5))
-                self.assertGreaterEqual(sm.pow_calls, 1)  # PoW ensured before announce
+                # The plugin owns the proof-of-work now (see pow.py): calling
+                # upstream's set_nostr_proof_of_work from this task would route
+                # into gen_nostr_ann_pow, which wedges the event loop thread if
+                # cancelled mid-grind -- the shutdown-hang bug.
+                self.assertEqual(sm.pow_calls, 0)
+                p.stop_server()
+
+    def test_publish_never_calls_upstream_pow(self):
+        # Explicit regression guard for the shutdown hang: no code path reached
+        # from publish_now may call SwapManager.set_nostr_proof_of_work.
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+        p = _make_plugin(_Config(relays="wss://relay.one"))
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
+        published = threading.Event()
+        with _LoopThread() as loop:
+            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
+                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport",
+                            self._fake_transport_cls(published)):
+                p.start_server()
+                self.assertTrue(published.wait(timeout=5))
+                p.stop_server()
+        self.assertEqual(sm.pow_calls, 0)
+
+    def test_publish_waits_for_pow_gate(self):
+        # An announcement made before the PoW is ready carries a nonce that
+        # takers reject, so publishing must wait for the gate to open.
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+        p = _make_plugin(_Config(relays="wss://relay.one"))
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
+        published = threading.Event()
+        with _LoopThread() as loop:
+            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
+                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport",
+                            self._fake_transport_cls(published)), \
+                 mock.patch.object(SwapServerGuiPlugin, "ensure_pow_nonce",
+                                   _never_finishing_pow):
+                p.start_server()
+                self.assertFalse(published.wait(timeout=1.5),
+                                 "announced before the proof-of-work was ready")
                 p.stop_server()
 
     def test_publish_now_waits_for_liquidity(self):

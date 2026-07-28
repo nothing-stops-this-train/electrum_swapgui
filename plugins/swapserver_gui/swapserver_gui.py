@@ -17,6 +17,13 @@
 #     ``ManagedHttpSwapServer`` keeps the ``AppRunner`` so we can shut it down.
 #   * The nostr server (``SwapManager.run_nostr_server``) is a long-running
 #     coroutine that cleans up when cancelled, so for it we just cancel the task.
+#   * Both ``run_nostr_server`` and ``SwapManager.set_nostr_proof_of_work`` route
+#     into ``electrum.util.gen_nostr_ann_pow``, which *deadlocks the event loop
+#     thread* if cancelled while grinding -- and cancelling is exactly what we do
+#     at shutdown.  That is what made Electrum hang on exit.  We therefore
+#     compute the announcement proof-of-work ourselves (``pow.py``) before
+#     starting the nostr transport, so upstream always finds a good cached nonce
+#     and never enters that function.  See ``pow.py`` for the full analysis.
 
 import asyncio
 import concurrent.futures
@@ -28,6 +35,8 @@ from electrum.plugin import BasePlugin
 from electrum.util import get_asyncio_loop
 from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED
 from electrum.submarine_swaps import NostrTransport
+
+from . import pow as swap_pow
 
 # Importing the bundled swapserver plugin's server module has the useful side
 # effect of registering the shared config vars (plugins.swapserver.port etc.)
@@ -107,6 +116,12 @@ class SwapServerGuiPlugin(BasePlugin):
         self._nostr_fut: Optional['concurrent.futures.Future'] = None
         self._publish_now_fut: Optional['concurrent.futures.Future'] = None
         self._running: bool = False
+        # Set once the announcement proof-of-work is usable (or once we know we
+        # cannot compute one, e.g. no nostr keypair). Gates the nostr announce
+        # path so we never publish an offer that takers would reject.
+        self._pow_gate: asyncio.Event = asyncio.Event()
+        self._pow_state: Optional['swap_pow.PowState'] = None
+        self._pow_grinding: bool = False
 
     # ------------------------------------------------------------------ utils
     @property
@@ -141,6 +156,103 @@ class SwapServerGuiPlugin(BasePlugin):
         if fut is not None:
             fut.cancel()
 
+    # ------------------------------------------------------------ proof of work
+    def _nostr_pubkey(self) -> Optional[bytes]:
+        """The x-only nostr pubkey the announcement PoW is bound to, if any.
+
+        Upstream hashes ``b'electrum-' + keypair.pubkey[1:]`` (the compressed
+        pubkey without its prefix byte), so we must use exactly the same bytes.
+        """
+        if self.wallet is None or self.wallet.lnworker is None:
+            return None
+        keypair = getattr(self.wallet.lnworker, "nostr_keypair", None)
+        pubkey = getattr(keypair, "pubkey", None)
+        if not isinstance(pubkey, (bytes, bytearray)) or len(pubkey) < 2:
+            return None
+        return bytes(pubkey[1:])
+
+    def _save_pow_state(self, state: 'swap_pow.PowState') -> None:
+        self._pow_state = state
+        try:
+            self.config.SWAPSERVER_GUI_POW_STATE = state.dumps()
+        except Exception:
+            self.logger.debug("could not persist proof-of-work state", exc_info=True)
+
+    async def ensure_pow_nonce(self) -> bool:
+        """Make sure ``SWAPSERVER_ANN_POW_NONCE`` satisfies ``SWAPSERVER_POW_TARGET``.
+
+        Returns True when a usable nonce is in place.  Always opens
+        :attr:`_pow_gate` before returning so the announce path is never
+        blocked forever, even when we cannot compute a proof of work.
+
+        This is cancellable and, unlike upstream's ``gen_nostr_ann_pow``,
+        cancelling it neither blocks nor wedges the event loop thread.
+        """
+        pubkey = self._nostr_pubkey()
+        if pubkey is None:
+            # No nostr keypair (or a stand-in without one): nothing to grind
+            # against. Let the caller proceed; upstream will report the problem.
+            self.logger.info("no nostr keypair available; skipping announcement proof-of-work")
+            self._pow_gate.set()
+            return False
+
+        target = int(self.config.SWAPSERVER_POW_TARGET or 0)
+        if swap_pow.pow_bits(pubkey, self.config.SWAPSERVER_ANN_POW_NONCE) >= target:
+            self.logger.debug("reusing cached nostr announcement proof-of-work")
+            self._pow_gate.set()
+            return True
+
+        state = swap_pow.PowState.load(
+            self.config.SWAPSERVER_GUI_POW_STATE, pubkey=pubkey, target=target)
+        self._pow_state = state
+        # A previously-found "best" nonce may already satisfy a lowered target.
+        if state.best_nonce is not None and state.best_bits >= target:
+            self.logger.info(f"reusing best-known nonce ({state.best_bits} bits) for target {target}")
+            self.config.SWAPSERVER_ANN_POW_NONCE = state.best_nonce
+            self._pow_gate.set()
+            return True
+
+        est = swap_pow.format_duration(swap_pow.estimate_seconds(target))
+        self.logger.info(
+            f"generating nostr announcement proof-of-work: target={target} bits, "
+            f"resuming from {state.hashes_done()} hashes already scanned, "
+            f"estimated {est}")
+        self._pow_grinding = True
+        try:
+            result = await swap_pow.grind(
+                pubkey=pubkey,
+                target_bits=target,
+                state=state,
+                on_progress=self._save_pow_state,
+            )
+        except asyncio.CancelledError:
+            # Search cursors were already persisted by pow.grind's cancel path,
+            # so the next attempt resumes instead of re-scanning.
+            self.logger.info("announcement proof-of-work cancelled; progress saved")
+            raise
+        finally:
+            self._pow_grinding = False
+            self._pow_gate.set()
+
+        if not result.found or result.nonce is None:
+            self.logger.warning("announcement proof-of-work ended without a solution")
+            return False
+        self.config.SWAPSERVER_ANN_POW_NONCE = result.nonce
+        self.logger.info(f"found nostr announcement proof-of-work: {result.bits} bits")
+        return True
+
+    async def _nostr_startup(self) -> None:
+        """Compute the PoW ourselves, then hand over to upstream's nostr server.
+
+        Ordering matters: ``run_nostr_server`` begins with
+        ``set_nostr_proof_of_work``, which grinds inside the un-cancellable
+        upstream helper.  By seeding a good nonce first we guarantee it
+        short-circuits, so cancelling this task at shutdown is always safe.
+        """
+        await self.ensure_pow_nonce()
+        assert self._sm is not None
+        await self._sm.run_nostr_server()
+
     # -------------------------------------------------------------- lifecycle
     def bind_wallet(self, wallet: 'Abstract_Wallet') -> None:
         """Associate this plugin instance with a wallet's swap manager."""
@@ -173,13 +285,16 @@ class SwapServerGuiPlugin(BasePlugin):
 
         port = self.config.SWAPSERVER_PORT
         relays = (self.config.NOSTR_RELAYS or "").strip()
+        self._pow_gate = asyncio.Event()  # fresh gate for this run
 
         if port:
             server = ManagedHttpSwapServer(self.config, self.wallet)
             sm.http_server = server
             self._http_fut = self._spawn(server.run(), "http")
         if relays:
-            self._nostr_fut = self._spawn(sm.run_nostr_server(), "nostr")
+            # _nostr_startup seeds the proof-of-work before starting upstream's
+            # nostr server; see the note in the module docstring.
+            self._nostr_fut = self._spawn(self._nostr_startup(), "nostr")
 
         self._running = True
         self.logger.info(f"swap server started (http_port={port or None}, "
@@ -227,13 +342,12 @@ class SwapServerGuiPlugin(BasePlugin):
         keypair = getattr(self.wallet.lnworker, "nostr_keypair", None)
         if keypair is None:
             return
-        # Ensure the announcement carries a valid proof-of-work nonce (reuses a
-        # cached one instantly; only grinds on a brand-new server key).
-        try:
-            await sm.set_nostr_proof_of_work()
-        except Exception:
-            self.logger.debug("set_nostr_proof_of_work failed before publish_now",
-                              exc_info=True)
+        # Wait for the announcement proof-of-work instead of computing one here.
+        # We must NOT call sm.set_nostr_proof_of_work(): it routes into
+        # electrum.util.gen_nostr_ann_pow, which wedges the event loop thread if
+        # this task is cancelled mid-grind. _nostr_startup owns the PoW and
+        # opens the gate; that path is cancel-safe. Waiting here is cancellable.
+        await self._pow_gate.wait()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.PUBLISH_NOW_LIQUIDITY_WAIT_SEC
         while True:
@@ -277,7 +391,16 @@ class SwapServerGuiPlugin(BasePlugin):
         # Stop the HTTP listener (needs an explicit aiohttp runner cleanup).
         # Schedule it on the loop fire-and-forget; do NOT block the GUI thread.
         if sm is not None and isinstance(getattr(sm, 'http_server', None), ManagedHttpSwapServer):
-            self._spawn(sm.http_server.stop(), "http-stop")
+            http_server = sm.http_server
+            # Unregister the EventListener synchronously: the cleanup coroutine
+            # below can be cancelled by the loop shutting down before it runs,
+            # and a stale registration would keep a stopped wallet's callbacks
+            # alive in the global registry.
+            try:
+                http_server.unregister_callbacks()
+            except Exception:
+                self.logger.debug("unregister_callbacks failed", exc_info=True)
+            self._spawn(http_server.stop(), "http-stop")
             sm.http_server = None
         self._cancel_fut(self._http_fut)
         self._cancel_fut(self._nostr_fut)
@@ -288,6 +411,7 @@ class SwapServerGuiPlugin(BasePlugin):
         if sm is not None:
             sm.is_server = False
         self._running = False
+        self._pow_grinding = False
         self.logger.info("swap server stopped")
 
     def request_pairs_update(self) -> None:
@@ -318,6 +442,11 @@ class SwapServerGuiPlugin(BasePlugin):
             ) if sm is not None else False,
             "nostr_enabled": bool(relays),
             "nostr_relay_count": len(relays),
+            "pow_target": int(self.config.SWAPSERVER_POW_TARGET or 0),
+            "pow_ready": self._pow_gate.is_set() and not self._pow_grinding,
+            "pow_grinding": self._pow_grinding,
+            "pow_best_bits": self._pow_state.best_bits if self._pow_state else 0,
+            "pow_hashes_done": self._pow_state.hashes_done() if self._pow_state else 0,
             "percentage": None,
             "min_amount": None,
             "max_forward": None,

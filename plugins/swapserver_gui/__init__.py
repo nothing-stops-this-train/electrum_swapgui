@@ -29,3 +29,16 @@ SimpleConfig.SWAPSERVER_GUI_AUTOSTART = ConfigVar(
     type_=bool,
     plugin='swapserver_gui',
 )
+
+# Resumable proof-of-work search state, as JSON (see swapserver_gui/pow.py).
+# Holds the nostr pubkey the search applies to, the per-lane nonce cursors, and
+# the best nonce seen so far.  Persisting this means a proof-of-work that gets
+# cancelled (e.g. by quitting Electrum mid-grind) is not thrown away: the next
+# run continues into untested nonce space instead of re-scanning the range it
+# already rejected.
+SimpleConfig.SWAPSERVER_GUI_POW_STATE = ConfigVar(
+    'plugins.swapserver_gui.pow_state',
+    default='',
+    type_=str,
+    plugin='swapserver_gui',
+)
