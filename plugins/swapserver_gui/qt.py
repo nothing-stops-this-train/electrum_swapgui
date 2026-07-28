@@ -6,6 +6,7 @@
 # Qt layer: injects a "Swap Server" tab into the main window and wires its
 # controls to the transport lifecycle implemented in ``swapserver_gui.py``.
 
+import importlib
 from typing import TYPE_CHECKING, Optional, Dict, Any
 
 from PyQt6.QtCore import Qt, QTimer
@@ -22,7 +23,9 @@ from electrum.gui.qt.util import read_QIcon
 from .swapserver_gui import (
     SwapServerGuiPlugin, SwapServerError, get_swap_history, get_swap_summary,
 )
-from . import pow as swap_pow
+# NB: not ``from . import pow as swap_pow`` -- that form breaks when Electrum
+# loads this plugin from a zip.  See the long comment in swapserver_gui.py.
+swap_pow = importlib.import_module('.pow', __package__)
 
 # Above this many bits a proof-of-work grind stops being a "wait a few minutes"
 # affair (see the estimate shown next to the spinbox), so we ask for confirmation.
