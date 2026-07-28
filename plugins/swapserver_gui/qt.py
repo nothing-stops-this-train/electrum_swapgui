@@ -63,6 +63,7 @@ class SwapServerTab(QWidget):
         self.config = plugin.config
         self.wallet = window.wallet
         self._npub: Optional[str] = None
+        self._pubkey_hex: Optional[str] = None
         self._check_running: bool = False
         self._alive: List[bool] = [True]  # cleared by clean_up(); see on_check_discoverability
         self.checkFinished.connect(self.on_check_finished)
@@ -172,24 +173,58 @@ class SwapServerTab(QWidget):
         # ---- nostr identity ------------------------------------------------
         # This is what a taker pins as SWAPSERVER_NPUB, so it belongs with the
         # operator-facing status rather than with the diagnostics.
+        #
+        # BOTH encodings are shown on purpose. They are the same key, but they
+        # look nothing alike, and the two places an operator sees it disagree:
+        # Electrum's "Choose Swap Provider" dialog renders the *hex*
+        # (electrum/gui/qt/swap_dialog.py: labels[Columns.PUBKEY] =
+        # x.server_pubkey) and keeps the npub only as hidden item data, while
+        # SWAPSERVER_NPUB -- what a taker actually pins -- is the *npub*.
+        # Showing one alone reads as "the GUI is displaying the wrong key".
         ident_box = QGroupBox(_("Nostr identity"))
-        ident_layout = QHBoxLayout(ident_box)
+        ident_grid = QGridLayout(ident_box)
+        ident_grid.setColumnStretch(2, 1)
+
         self.npub_icon = QLabel()
         self.npub_icon.setFixedWidth(18)
         self.npub_icon.setToolTip(
-            _("Identicon takers see next to this server in their provider list."))
-        ident_layout.addWidget(self.npub_icon)
+            _("Identicon takers see next to this server in their provider list.\n"
+              "It is derived from the key, so it is the quickest way to confirm "
+              "a provider entry is this server."))
+        ident_grid.addWidget(self.npub_icon, 0, 0)
+
         self.npub_label = QLabel("—")
         self.npub_label.setWordWrap(True)
         self.npub_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         self.npub_label.setToolTip(
-            _("The nostr public key this swap server announces under.\n"
-              "Give it to a taker to select this server directly."))
-        ident_layout.addWidget(self.npub_label, 1)
+            _("The nostr public key this swap server announces under, in bech32 "
+              "(NIP-19) form.\nThis is the value a taker stores as their chosen "
+              "swap provider."))
+        ident_grid.addWidget(QLabel(_("npub:")), 0, 1)
+        ident_grid.addWidget(self.npub_label, 0, 2)
         self.npub_copy_btn = QPushButton(_("Copy"))
         self.npub_copy_btn.clicked.connect(self.on_copy_npub)
-        ident_layout.addWidget(self.npub_copy_btn)
+        ident_grid.addWidget(self.npub_copy_btn, 0, 3)
+
+        self.pubkey_hex_label = QLabel("—")
+        self.pubkey_hex_label.setWordWrap(True)
+        self.pubkey_hex_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.pubkey_hex_label.setToolTip(
+            _("The same key in hex. This is the form Electrum's 'Choose Swap "
+              "Provider' dialog lists,\nso compare against this one when "
+              "checking that a taker can see this server."))
+        ident_grid.addWidget(QLabel(_("hex:")), 1, 1)
+        ident_grid.addWidget(self.pubkey_hex_label, 1, 2)
+        self.pubkey_hex_copy_btn = QPushButton(_("Copy"))
+        self.pubkey_hex_copy_btn.clicked.connect(self.on_copy_pubkey_hex)
+        ident_grid.addWidget(self.pubkey_hex_copy_btn, 1, 3)
+
+        hint = QLabel(_("Same key, two encodings. Takers list the hex form."))
+        hint.setEnabled(False)  # renders dimmed, like secondary text
+        ident_grid.addWidget(hint, 2, 2, 1, 2)
+
         outer.addWidget(ident_box)
 
         grid = QGridLayout()
@@ -403,7 +438,12 @@ class SwapServerTab(QWidget):
     def on_copy_npub(self) -> None:
         if not self._npub:
             return
-        self.window.do_copy(self._npub, title=_("Nostr pubkey"))
+        self.window.do_copy(self._npub, title=_("Nostr pubkey (npub)"))
+
+    def on_copy_pubkey_hex(self) -> None:
+        if not self._pubkey_hex:
+            return
+        self.window.do_copy(self._pubkey_hex, title=_("Nostr pubkey (hex)"))
 
     # ---------------------------------------------------------- diagnostics
     def on_check_discoverability(self) -> None:
@@ -569,14 +609,18 @@ class SwapServerTab(QWidget):
         npub = st["nostr_npub"]
         pubkey = st["nostr_pubkey"]
         self._npub = npub
+        self._pubkey_hex = pubkey
         self.npub_copy_btn.setEnabled(bool(npub))
+        self.pubkey_hex_copy_btn.setEnabled(bool(pubkey))
         if not npub or not pubkey:
             self.npub_label.setText(_("no nostr key (wallet has no lightning)"))
+            self.pubkey_hex_label.setText("—")
             self.npub_icon.clear()
-            self.npub_label.setToolTip("")
             return
         self.npub_label.setText(npub)
-        self.npub_label.setToolTip(_("hex: {}").format(pubkey))
+        self.pubkey_hex_label.setText(pubkey)
+        # Both sides feed the *hex* into pubkey_to_q_icon, so this square is
+        # identical to the one beside this server in a taker's provider list.
         self.npub_icon.setPixmap(pubkey_to_q_icon(pubkey).pixmap(16, 16))
 
     def _refresh_diagnostics(self, st: Dict[str, Any]) -> None:
