@@ -27,6 +27,7 @@
 
 import asyncio
 import concurrent.futures
+import functools
 import importlib
 import time
 from enum import Enum
@@ -35,6 +36,7 @@ from typing import TYPE_CHECKING, Optional, List, Dict, Any, Tuple
 from aiohttp import web
 
 from electrum import constants
+from electrum.i18n import _
 from electrum.plugin import BasePlugin
 from electrum.util import get_asyncio_loop
 from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED
@@ -134,6 +136,93 @@ class AnnounceState(Enum):
         return self is AnnounceState.ANNOUNCING
 
 
+# ---------------------------------------------------------------------------
+# Telling *served* swaps apart from the operator's own swaps
+#
+# ``SwapManager._swaps`` (wallet.db['submarine_swaps']) is the wallet's single
+# store of every submarine swap it has ever been part of, and ``SwapData``
+# (electrum/submarine_swaps.py) carries no field saying which side we were on:
+# the maker and the taker of the same swap write the same 13 attributes.  So
+# counting all of them -- which is what upstream's ``swapserver.get_history``
+# command does, and what this plugin used to copy -- reports the operator's own
+# swaps as revenue served to other people.
+#
+# Two mechanisms, in order of authority:
+#   1. the ledger below: every swap created through the server's own entry
+#      points is recorded by payment hash while our server is running.  Exact,
+#      but only for swaps created since this version was installed.
+#   2. :func:`looks_server_side`, a field heuristic, for everything older.
+# ---------------------------------------------------------------------------
+
+#: Wallet-db key holding ``{payment_hash_hex: unix_ts}`` for swaps our server
+#: served.  A plain top-level key, like ``labels``'s ``wallet_nonce`` or
+#: trustedcoin's billing addresses; it survives the db's save/reload cycle and
+#: is ignored by everything else.
+SERVED_SWAPS_DB_KEY = 'swapserver_gui_served_swaps'
+
+
+def served_swaps_ledger(wallet: 'Abstract_Wallet') -> Dict[str, int]:
+    """The ``{payment_hash_hex: recorded_at}`` map, creating it if absent.
+
+    Returns the live ``StoredDict``, so assigning into it is persisted (as an
+    incremental json patch, not a rewrite of the whole map).
+    """
+    try:
+        return wallet.db.get_dict(SERVED_SWAPS_DB_KEY)
+    except Exception:
+        return {}
+
+
+def record_served_swap(wallet: 'Abstract_Wallet', payment_hash_hex: str) -> bool:
+    """Mark ``payment_hash_hex`` as a swap our server created for a taker."""
+    if not payment_hash_hex:
+        return False
+    ledger = served_swaps_ledger(wallet)
+    if payment_hash_hex in ledger:
+        return False
+    ledger[payment_hash_hex] = int(time.time())
+    return True
+
+
+def looks_server_side(swap: Any) -> bool:
+    """Best-effort role guess for a swap that predates the ledger.
+
+    The four creation paths in electrum/submarine_swaps.py leave distinguishable
+    field combinations behind, because the prepayment is asymmetric:
+
+    ==============================================  ==========  ===========  ===============
+    stored by                                       is_reverse  prepay_hash  claim_to_output
+    ==============================================  ==========  ===========  ===============
+    server, serving a taker's reverse swap          False       set          None
+      (``create_normal_swap`` -> ``prepay=True``)
+    server, serving a taker's forward swap          True        None         None
+      (``create_reverse_swap``)
+    us, our own forward swap                        False       None         None
+      (``request_normal_swap`` -> ``prepay=False``)
+    us, our own reverse swap (``reverse_swap``)     True        set*         maybe set
+    ==============================================  ==========  ===========  ===============
+
+    (*) the taker stores a prepay hash whenever the server answered with a
+    ``minerFeeInvoice``, which every Electrum server does -- ``create_normal_swap``
+    hardcodes ``prepay=True``.  The one swap this misfiles is our own reverse
+    swap against a server that asked for no mining-fee prepayment; the non-prepay
+    ``'submarine'`` request type is rejected as deprecated by Electrum servers,
+    so it does not arise in practice.  Swaps created from now on are covered
+    exactly by :data:`SERVED_SWAPS_DB_KEY` regardless.
+    """
+    if not getattr(swap, 'is_reverse', False):
+        return getattr(swap, 'prepay_hash', None) is not None
+    return (getattr(swap, 'prepay_hash', None) is None
+            and getattr(swap, 'claim_to_output', None) is None)
+
+
+def is_served_swap(swap: Any, payment_hash_hex: str, ledger: Dict[str, int]) -> bool:
+    """True when ``swap`` was created for a remote taker by our swap server."""
+    if payment_hash_hex in ledger:
+        return True
+    return looks_server_side(swap)
+
+
 def has_liquidity_to_announce(
         *,
         min_amount: Optional[int],
@@ -212,6 +301,8 @@ class SwapServerGuiPlugin(BasePlugin):
         self._nostr_fut: Optional['concurrent.futures.Future'] = None
         self._publish_now_fut: Optional['concurrent.futures.Future'] = None
         self._running: bool = False
+        # The swap manager whose server_create_* methods we wrapped, if any.
+        self._recorded_sm: Optional['SwapManager'] = None
         # Set once the announcement proof-of-work is usable (or once we know we
         # cannot compute one, e.g. no nostr keypair). Gates the nostr announce
         # path so we never publish an offer that takers would reject.
@@ -259,6 +350,96 @@ class SwapServerGuiPlugin(BasePlugin):
     def _cancel_fut(fut: Optional['concurrent.futures.Future']) -> None:
         if fut is not None:
             fut.cancel()
+
+    # -------------------------------------------------- served-swap bookkeeping
+    #: Instance attribute we hang on the SwapManager to mark it as wrapped and
+    #: to remember what to put back.  Maps method name -> the instance attribute
+    #: that was shadowing the class method before us (None if there was none).
+    _RECORDER_MARK = '_swapserver_gui_recorder'
+
+    #: The only two SwapManager methods that create a swap on behalf of a remote
+    #: taker.  Both transports funnel into them -- the HTTP endpoint via
+    #: electrum/plugins/swapserver/server.py (``create_swap``/``create_normal_swap``
+    #: handlers) and nostr via ``NostrTransport._handle_requests`` -- so wrapping
+    #: the pair catches every served swap without touching either transport.
+    _SERVER_CREATE_METHODS = ('server_create_swap', 'server_create_normal_swap')
+
+    def _install_served_swap_recorder(self, sm: 'SwapManager') -> None:
+        """Start recording which swaps this server creates for takers.
+
+        Wrapping the two entry points on the *instance* keeps upstream's class
+        untouched, so nothing leaks into other wallets or survives
+        :meth:`stop_server`.
+        """
+        if getattr(sm, self._RECORDER_MARK, None) is not None:
+            return  # already wrapped (start_server is idempotent)
+        wallet = self.wallet
+        if wallet is None:
+            return
+        shadowed: Dict[str, Any] = {}
+        for name in self._SERVER_CREATE_METHODS:
+            original = getattr(sm, name, None)
+            if original is None:
+                self.logger.debug(f"swap manager has no {name}; not recording served swaps")
+                continue
+            shadowed[name] = sm.__dict__.get(name)
+            setattr(sm, name, self._wrap_server_create(original, wallet))
+        setattr(sm, self._RECORDER_MARK, shadowed)
+        # Remember which manager we patched rather than re-deriving it at stop
+        # time: ``bind_wallet`` can point ``_sm`` at a second wallet's manager
+        # while this one's server is still running, and unwrapping the wrong
+        # object would leave this one wrapped forever.
+        self._recorded_sm = sm
+
+    def _wrap_server_create(self, original: Any, wallet: 'Abstract_Wallet') -> Any:
+        """Wrap a ``server_create_*`` method so its swap lands in the ledger.
+
+        Both wrapped methods answer with the swap's payment hash under ``'id'``
+        (electrum/submarine_swaps.py, ``server_create_swap`` /
+        ``server_create_normal_swap``).  Recording must never be able to fail the
+        swap itself: a swap we do not record is merely classified by
+        :func:`looks_server_side` later, whereas an exception here would be
+        returned to the taker as a failed request.
+        """
+        @functools.wraps(original)
+        def wrapper(request: Dict[str, Any], *args: Any, **kwargs: Any) -> Dict[str, Any]:
+            response = original(request, *args, **kwargs)
+            try:
+                payment_hash_hex = response['id']
+                if record_served_swap(wallet, payment_hash_hex):
+                    self.logger.info(f"served swap recorded: {payment_hash_hex}")
+            except Exception:
+                self.logger.warning(
+                    "could not record a served swap; it will be classified "
+                    "heuristically in the history", exc_info=True)
+            return response
+        return wrapper
+
+    def _remove_served_swap_recorder(self, sm: Optional['SwapManager'] = None) -> None:
+        """Undo :meth:`_install_served_swap_recorder`. Idempotent.
+
+        Defaults to the manager that was actually wrapped, which is not always
+        the one ``self._sm`` currently points at.
+        """
+        if sm is None:
+            sm = self._recorded_sm
+        if sm is None:
+            return
+        shadowed = getattr(sm, self._RECORDER_MARK, None)
+        if shadowed is None:
+            self._recorded_sm = None
+            return
+        for name, previous in shadowed.items():
+            if previous is None:
+                sm.__dict__.pop(name, None)  # expose the class method again
+            else:
+                setattr(sm, name, previous)
+        try:
+            delattr(sm, self._RECORDER_MARK)
+        except AttributeError:
+            pass
+        if sm is self._recorded_sm:
+            self._recorded_sm = None
 
     # ------------------------------------------------------------ proof of work
     def _nostr_pubkey(self) -> Optional[bytes]:
@@ -429,6 +610,10 @@ class SwapServerGuiPlugin(BasePlugin):
         assert self._sm is not None and self.wallet is not None
         sm = self._sm
         sm.is_server = True
+        # Before any transport can accept a request: from here on, every swap
+        # created for a taker is recorded, so the history can tell them apart
+        # from the operator's own swaps without guessing.
+        self._install_served_swap_recorder(sm)
 
         port = self.config.SWAPSERVER_PORT
         relays = (self.config.NOSTR_RELAYS or "").strip()
@@ -567,6 +752,7 @@ class SwapServerGuiPlugin(BasePlugin):
         self._publish_now_fut = None
         if sm is not None:
             sm.is_server = False
+        self._remove_served_swap_recorder()
         self._running = False
         self._pow_grinding = False
         self.logger.info("swap server stopped")
@@ -774,25 +960,48 @@ def save_settings(
 
 
 def get_swap_history(wallet: 'Abstract_Wallet') -> List[Dict[str, Any]]:
-    """Confirmed swaps served by this node (mirrors the bundled swapserver
-    plugin's ``get_history`` command, but as a plain sync helper)."""
+    """Confirmed swaps this node *served to other wallets*.
+
+    Structured like the bundled swapserver plugin's ``get_history`` command, but
+    with two differences that matter to an operator reading the Status tab:
+
+    * swaps the operator's own wallet initiated as a customer are left out.
+      Upstream counts them (it walks all of ``sm._swaps``), which inflates both
+      the swap count and the net return with activity nobody was served.  See
+      :func:`is_served_swap` for how the two are told apart.
+    * a batched transaction that settles a served swap *and* one of our own is
+      still reported -- dropping it would hide real revenue -- but is marked
+      ``is_mixed``, because its ``return_sat`` covers both.  ``wallet``'s history
+      aggregates value per group, so there is no per-swap split to report
+      instead.  This happens because ``_claim_swap`` puts the claim inputs of
+      every ``is_reverse`` swap into one ``'swaps'`` tx batch regardless of which
+      side we were on, and both roles then share the resulting ``spending_txid``.
+
+    Each entry additionally carries ``num_served_swaps``/``num_own_swaps``.
+    """
     if not wallet.lnworker or not wallet.lnworker.swap_manager:
         return []
     sm = wallet.lnworker.swap_manager
-    swap_group_ids = set()
-    for swap in sm._swaps.values():
+    ledger = served_swaps_ledger(wallet)
+    # group id -> [swaps we served, swaps we initiated ourselves]
+    groups: Dict[str, List[int]] = {}
+    for payment_hash_hex, swap in list(sm._swaps.items()):
         group_id = swap.spending_txid if swap.is_reverse else swap.funding_txid
         if group_id is None:
             continue
         if swap.spending_txid is None \
                 or wallet.adb.get_tx_height(swap.spending_txid).height() <= TX_HEIGHT_UNCONFIRMED:
+            # only final swaps, so the history is stable and excludes pending ones
             continue
-        swap_group_ids.add(group_id)
+        counts = groups.setdefault(group_id, [0, 0])
+        counts[0 if is_served_swap(swap, payment_hash_hex, ledger) else 1] += 1
 
     result: List[Dict[str, Any]] = []
     full_history = wallet.get_full_history()
-    for swap_group_id in swap_group_ids:
-        item = full_history.get('group:' + swap_group_id)
+    for group_id, (num_served, num_own) in groups.items():
+        if not num_served:
+            continue  # entirely the operator's own swaps
+        item = full_history.get('group:' + group_id)
         if not item:
             continue
         result.append({
@@ -800,14 +1009,57 @@ def get_swap_history(wallet: 'Abstract_Wallet') -> List[Dict[str, Any]]:
             'return_sat': int(item['value'].value),
             'date': item['date'].strftime("%Y-%m-%d"),
             'timestamp': item['timestamp'],
+            'num_served_swaps': num_served,
+            'num_own_swaps': num_own,
+            'is_mixed': num_own > 0,
         })
     return sorted(result, key=lambda x: x['timestamp'])
 
 
+#: Appended to a history row whose transaction was batched with a swap of the
+#: operator's own, so its value is not purely server revenue.
+MIXED_ROW_MARKER = "⚠ batched"
+
+
+def format_summary_line(
+        *,
+        num_swaps: int,
+        net_return: str,
+        swaps_per_day: float,
+        num_mixed: int,
+) -> str:
+    """The one-line summary above the history table.
+
+    Pure, and here rather than in ``qt.py``, so it is testable without PyQt6
+    (same reasoning as :func:`save_settings`).  ``net_return`` arrives
+    pre-formatted because only the GUI knows the user's unit settings.
+    """
+    text = _("Swaps served: {num} · net return: {ret} · {rate}/day").format(
+        num=num_swaps, ret=net_return, rate=swaps_per_day)
+    if num_mixed:
+        text += " · " + _("{n} batched with own swaps").format(n=num_mixed)
+    return text
+
+
+def format_mixed_note(*, num_served: int, num_own: int) -> str:
+    """Why a flagged row's return value is not purely server revenue."""
+    return _(
+        "This transaction was batched: it settles {served} swap(s) served by this "
+        "server together with {own} swap(s) this wallet initiated itself.\n"
+        "The return shown covers all of them, so it is not purely server revenue."
+    ).format(served=num_served, own=num_own)
+
+
 def get_swap_summary(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate stats for a list produced by :func:`get_swap_history`."""
+    """Aggregate stats for a list produced by :func:`get_swap_history`.
+
+    ``num_mixed`` counts entries whose value is not purely server revenue
+    because the transaction was batched with one of the operator's own swaps.
+    """
+    num_mixed = sum(1 for s in history if s.get('is_mixed'))
     if not history:
-        return {'num_swaps': 0, 'overall_return_sat': 0, 'swaps_per_day': 0.0}
+        return {'num_swaps': 0, 'overall_return_sat': 0, 'swaps_per_day': 0.0,
+                'num_mixed': 0}
     profit_loss_sum = sum(s['return_sat'] for s in history)
     first_swap = min(s['timestamp'] for s in history)
     last_swap = max(s['timestamp'] for s in history)
@@ -817,4 +1069,5 @@ def get_swap_summary(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         'num_swaps': len(history),
         'overall_return_sat': profit_loss_sum,
         'swaps_per_day': round(swaps_per_day, 2),
+        'num_mixed': num_mixed,
     }

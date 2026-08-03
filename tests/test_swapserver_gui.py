@@ -397,7 +397,8 @@ class SummaryTests(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(
             get_swap_summary([]),
-            {'num_swaps': 0, 'overall_return_sat': 0, 'swaps_per_day': 0.0},
+            {'num_swaps': 0, 'overall_return_sat': 0, 'swaps_per_day': 0.0,
+             'num_mixed': 0},
         )
 
     def test_aggregates_and_rate(self):
@@ -412,6 +413,20 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summary['overall_return_sat'], 120)
         # 3 swaps over 2 days
         self.assertEqual(summary['swaps_per_day'], 1.5)
+        self.assertEqual(summary['num_mixed'], 0)
+
+    def test_counts_mixed_entries(self):
+        history = [
+            {'return_sat': 100, 'timestamp': 0, 'date': 'x', 'label': 'a'},
+            {'return_sat': 50, 'timestamp': 10, 'date': 'y', 'label': 'b',
+             'is_mixed': True},
+        ]
+        summary = get_swap_summary(history)
+        self.assertEqual(summary['num_swaps'], 2)
+        self.assertEqual(summary['num_mixed'], 1)
+        # a batched entry still contributes its value: dropping it would
+        # under-report revenue that was really earned.
+        self.assertEqual(summary['overall_return_sat'], 150)
 
 
 if __name__ == "__main__":

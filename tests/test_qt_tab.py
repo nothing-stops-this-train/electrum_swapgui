@@ -321,6 +321,50 @@ class QtTabTests(unittest.TestCase):
         self.assertIn("relay", window.show_error.call_args[0][0])
         self.assertTrue(tab.check_btn.isEnabled())  # not left stuck on "Checking…"
 
+    # --------------------------------------------------------------- history
+    # The filtering itself lives in test_served_swaps.py; these cover what the
+    # operator actually reads off the Status tab.
+    def _history_rows(self, tab):
+        tree = tab.history_tree
+        return [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+
+    def test_history_counts_only_served_swaps(self):
+        tab, _, _, _ = self._make_tab()
+        history = [{'label': 'Forward swap', 'return_sat': 205, 'date': '2025-09-04',
+                    'timestamp': 1756982141, 'num_served_swaps': 1,
+                    'num_own_swaps': 0, 'is_mixed': False}]
+        with mock.patch("swapserver_gui.qt.get_swap_history", return_value=history):
+            tab.refresh()
+        self.assertIn("Swaps served: 1", tab.summary_label.text())
+        self.assertNotIn("batched", tab.summary_label.text())
+        rows = self._history_rows(tab)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].text(1), 'Forward swap')
+        self.assertEqual(rows[0].toolTip(1), "")
+
+    def test_batched_row_is_flagged_not_hidden(self):
+        """A group covering a served swap AND one of ours still counts, but its
+        value is not purely server revenue, so the row has to say so."""
+        tab, _, _, _ = self._make_tab()
+        history = [{'label': 'Reverse swap', 'return_sat': 64, 'date': '2025-09-04',
+                    'timestamp': 1756983236, 'num_served_swaps': 1,
+                    'num_own_swaps': 1, 'is_mixed': True}]
+        with mock.patch("swapserver_gui.qt.get_swap_history", return_value=history):
+            tab.refresh()
+        self.assertIn("1 batched with own swaps", tab.summary_label.text())
+        rows = self._history_rows(tab)
+        self.assertEqual(len(rows), 1)                 # reported, not dropped
+        self.assertIn("batched", rows[0].text(1))
+        self.assertEqual(rows[0].text(2), "64")        # value still shown in full
+        self.assertIn("not purely", rows[0].toolTip(1))
+        self.assertIn("not purely", rows[0].toolTip(2))
+
+    def test_history_survives_a_failing_swap_manager(self):
+        tab, _, _, _ = self._make_tab()
+        with mock.patch("swapserver_gui.qt.get_swap_history",
+                        side_effect=RuntimeError("boom")):
+            tab.refresh()  # must not raise into the 4s timer
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -16,7 +16,8 @@ From the tab you can:
     copyable, with the identicon takers see), the advertised pairs (min /
     max-forward / max-reverse / mining fee / fee %), your lightning
     send/receive liquidity, and the history & running P/L of swaps this node
-    has served.
+    has served — swaps you initiate yourself as a customer are **not** counted
+    (see [which swaps are counted](#a-note-on-which-swaps-are-counted)).
   - **Diagnostics** — why the offer is or is not going out, the three values a
     taker's filter must match, and a one-click **discoverability check**. See
     [Why can nobody see my swap server?](#why-can-nobody-see-my-swap-server)
@@ -192,9 +193,46 @@ ELECTRUM_SRC=/path/to/electrum python3 -m unittest discover -s tests -v
   published with `electrum_aionostr` exactly as the server does, signatures are
   verified on receipt, and each failure mode (low PoW, wrong net, wrong version,
   crowded out, unreachable) is asserted to be named correctly.
+- `tests/test_served_swaps.py` — the served-vs-own classifier, the recorded
+  ledger, the history filter and the flagging of batched groups.
+- `tests/test_served_swaps_e2e.py` — a taker requests swaps over the **real**
+  HTTP endpoint against Electrum's **real** `SwapManager` on a **real**
+  `WalletDB`; asserts only those reach the history, and that the classification
+  survives dumping and reloading the wallet file.
 - `tests/test_qt_tab.py` — builds the real `SwapServerTab` on Qt's offscreen
   platform and drives `refresh()`. **Skips when PyQt6 is not installed**; CI
   installs it so these run there.
+
+### A note on which swaps are counted
+
+"Swaps served" means swaps this server provided to *other* wallets. That
+distinction is not free: `SwapManager._swaps` (`wallet.db['submarine_swaps']`) is
+one store shared by both roles, and `SwapData` has no field naming the side we
+were on — the maker and the taker of the same swap write the same attributes.
+Upstream's `swapserver.get_history` command counts all of them, so an operator
+who also swaps as a customer sees their own activity reported as revenue served.
+
+Two mechanisms replace that guess, in order of authority:
+
+1. **A recorded ledger.** While the server runs, the plugin wraps the only two
+   entry points that create a swap for a remote taker — `server_create_swap` and
+   `server_create_normal_swap`, which both the HTTP endpoint and the nostr
+   transport funnel into — and records each payment hash under the wallet-db key
+   `swapserver_gui_served_swaps`. Exact, for every swap created since this
+   version was installed.
+2. **A field heuristic** (`looks_server_side`) for older swaps, keyed on the
+   asymmetric mining-fee prepayment: a server's normal swap always carries a
+   `prepay_hash` (`create_normal_swap` hardcodes `prepay=True`) while our own
+   forward swap never does (`request_normal_swap` passes `prepay=False`), and the
+   reverse pair mirrors it. The e2e test asserts this table against the objects
+   upstream actually builds, so it cannot drift silently.
+
+One case survives both: `_claim_swap` feeds the claim input of *every*
+`is_reverse` swap into the single `'swaps'` tx batch regardless of role, so one
+batched transaction can settle a served swap together with one of your own.
+Wallet history aggregates value per group, so there is no per-swap split to
+report. Such rows are counted (dropping them would hide real revenue) and marked
+`⚠ batched`, with a tooltip saying the value covers both.
 
 ### A note on the HTTP port
 

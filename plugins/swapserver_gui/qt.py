@@ -22,8 +22,9 @@ from electrum.plugin import hook
 from electrum.gui.qt.util import read_QIcon, pubkey_to_q_icon, WWLabel, ColorScheme
 
 from .swapserver_gui import (
-    SwapServerGuiPlugin, SwapServerError, AnnounceState, get_swap_history,
-    get_swap_summary, save_settings,
+    SwapServerGuiPlugin, SwapServerError, AnnounceState, MIXED_ROW_MARKER,
+    format_mixed_note, format_summary_line, get_swap_history, get_swap_summary,
+    save_settings,
 )
 # NB: not ``from . import pow as swap_pow`` -- that form breaks when Electrum
 # loads this plugin from a zip.  See the long comment in swapserver_gui.py.
@@ -250,6 +251,9 @@ class SwapServerTab(QWidget):
         outer.addLayout(grid)
 
         self.summary_label = QLabel("—")
+        self.summary_label.setToolTip(_(
+            "Confirmed swaps this server provided to other wallets.\n"
+            "Swaps this wallet initiated itself as a customer are not counted."))
         outer.addWidget(self.summary_label)
 
         self.history_tree = QTreeWidget()
@@ -680,17 +684,27 @@ class SwapServerTab(QWidget):
             self.plugin.logger.debug("failed to compute swap history", exc_info=True)
             return
         summary = get_swap_summary(history)
-        self.summary_label.setText(
-            _("Swaps served: {num} · net return: {ret} · {rate}/day").format(
-                num=summary["num_swaps"],
-                ret=_fmt_sat(self.config, summary["overall_return_sat"]),
-                rate=summary["swaps_per_day"],
-            ))
+        self.summary_label.setText(format_summary_line(
+            num_swaps=summary["num_swaps"],
+            net_return=_fmt_sat(self.config, summary["overall_return_sat"]),
+            swaps_per_day=summary["swaps_per_day"],
+            num_mixed=summary["num_mixed"],
+        ))
         self.history_tree.clear()
         for item in reversed(history):  # newest first
-            self.history_tree.addTopLevelItem(QTreeWidgetItem([
-                item["date"], item["label"], str(item["return_sat"]),
-            ]))
+            label = item["label"]
+            if item.get("is_mixed"):
+                label += "  " + MIXED_ROW_MARKER
+            tree_item = QTreeWidgetItem([item["date"], label, str(item["return_sat"])])
+            if item.get("is_mixed"):
+                # The return value covers every swap in the batch, so it is not
+                # purely server revenue. Say so rather than silently counting it
+                # (or silently dropping the row and under-reporting).
+                tip = format_mixed_note(num_served=item["num_served_swaps"],
+                                        num_own=item["num_own_swaps"])
+                tree_item.setToolTip(1, tip)
+                tree_item.setToolTip(2, tip)
+            self.history_tree.addTopLevelItem(tree_item)
 
 
 class Plugin(SwapServerGuiPlugin):
