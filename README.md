@@ -4,6 +4,8 @@ A Qt GUI plugin for [Electrum](https://github.com/spesmilo/electrum) that adds a
 **Swap Server** tab for managing Electrum's built-in submarine swap server
 ([docs](https://electrum.readthedocs.io/en/latest/swapserver.html)).
 
+** This software is provided AS-IS without any warranty. You are responsible for the security of your own funds. **
+
 ![The Swap Server tab](docs/swap_server_tab.png)
 
 From the tab you can:
