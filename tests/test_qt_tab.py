@@ -15,8 +15,10 @@ What is deliberately NOT covered here: the visual layout, and the live path
 from the check button through the asyncio loop to a relay (that is
 ``test_discovery_e2e.py``'s job; here the report is injected directly).
 """
+import concurrent.futures
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -225,6 +227,97 @@ class QtTabTests(unittest.TestCase):
         tab.refresh()
         self.assertIn("unlock", tab._out_labels["nostr"].text())
         self.assertIn("password", tab.announce_reason.text())
+
+    # ----------------------------------------------- last-announcement report
+    def _announcing_tab(self, **plugin_state):
+        tab, plugin, sm, _ = self._make_tab()
+        plugin._running = True
+        sm._max_forward = 150000
+        for name, value in plugin_state.items():
+            setattr(plugin, name, value)
+        return tab, plugin, sm
+
+    def test_never_announced_says_so(self):
+        tab, _, _ = self._announcing_tab()
+        tab.refresh()
+        self.assertIn("has not announced yet", tab.last_publish_label.text())
+
+    def test_reports_the_acknowledged_announcement(self):
+        # The reported bug: this line only ever showed the moment the server was
+        # started, so a healthy server that had been up for days reported its
+        # last announcement as days old. It must report the last publish a relay
+        # actually acknowledged.
+        tab, _, _ = self._announcing_tab(
+            _last_publish_attempt_at=time.time() - 120,
+            _last_publish_success_at=time.time() - 120,
+            _last_publish_note="accepted by a relay")
+        tab.refresh()
+        text = tab.last_publish_label.text()
+        self.assertIn("accepted by a relay", text)
+        self.assertIn("2 min ago", text)
+        # a successful attempt is not also reported separately as an "attempt"
+        self.assertNotIn("last attempt", text)
+
+    def test_a_failed_attempt_after_a_success_is_shown_separately(self):
+        tab, _, _ = self._announcing_tab(
+            _last_publish_success_at=time.time() - 600,
+            _last_publish_attempt_at=time.time() - 30,
+            _last_publish_note="failed: TimeoutError: no relay acknowledged")
+        tab.refresh()
+        text = tab.last_publish_label.text()
+        self.assertIn("Last announcement accepted by a relay: 10 min ago", text)
+        self.assertIn("last attempt 30s ago", text)
+        self.assertIn("TimeoutError", text)
+
+    def test_a_stale_announcement_is_flagged_even_while_announcing(self):
+        # Everything else can look healthy while the offer has quietly expired
+        # on the relays; the age is the only thing that gives it away.
+        interval = SwapServerGuiPlugin.REPUBLISH_INTERVAL_SEC
+        tab, plugin, _ = self._announcing_tab(
+            _last_publish_success_at=time.time() - 3 * interval,
+            _last_publish_attempt_at=time.time() - 3 * interval)
+        tab.refresh()
+        self.assertIs(plugin.status()["announce_state"], AnnounceState.ANNOUNCING)
+        self.assertIn("⚠", tab.announce_reason.text())
+        self.assertIn("longer than", tab.announce_reason.text())
+
+    def test_a_fresh_announcement_is_not_flagged(self):
+        tab, _, _ = self._announcing_tab(
+            _last_publish_success_at=time.time() - 10,
+            _last_publish_attempt_at=time.time() - 10)
+        tab.refresh()
+        self.assertNotIn("⚠", tab.announce_reason.text())
+
+    # ------------------------------------------------- announce-loop failures
+    def test_loop_failure_states_are_rendered(self):
+        # Each of these used to render as "announcing to 2 relay(s)", which is
+        # the worst possible answer: the operator believes they are visible.
+        dead_fut = concurrent.futures.Future()
+        dead_fut.set_exception(RuntimeError("boom"))
+        cases = [
+            ("no relay reachable", AnnounceState.NO_RELAY_CONNECTED,
+             dict(_relay_connected=False)),
+            ("relays reject the offer", AnnounceState.PUBLISH_FAILING,
+             dict(_consecutive_publish_failures=3)),
+            ("task died", AnnounceState.TASK_DEAD,
+             dict(_nostr_fut=dead_fut)),
+        ]
+        for expected, state, plugin_state in cases:
+            with self.subTest(state=state):
+                tab, plugin, _ = self._announcing_tab(**plugin_state)
+                # supervise() would resurrect the dead task on a real loop
+                plugin.supervise = lambda: None
+                tab.refresh()
+                self.assertIs(plugin.status()["announce_state"], state)
+                self.assertIn("Not announcing", tab.announce_label.text())
+                self.assertIn(expected, tab._out_labels["nostr"].text())
+                self.assertTrue(tab.announce_reason.text())
+
+    def test_refresh_supervises_the_announce_task(self):
+        tab, plugin, _ = self._announcing_tab()
+        with mock.patch.object(plugin, "supervise") as supervise:
+            tab.refresh()
+        supervise.assert_called_once()
 
     # ---------------------------------------------------------- match fields
     def test_match_fields_are_rendered(self):

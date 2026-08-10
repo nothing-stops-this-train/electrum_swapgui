@@ -25,8 +25,10 @@ for p in (_ELECTRUM_SRC, _PLUGINS_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+from electrum.submarine_swaps import NostrTransport as _RealNostrTransport  # noqa: E402
+
 from swapserver_gui.swapserver_gui import (  # noqa: E402
-    SwapServerGuiPlugin, SwapServerError, ManagedHttpSwapServer,
+    AnnounceState, SwapServerGuiPlugin, SwapServerError, ManagedHttpSwapServer,
     get_swap_summary,
 )
 
@@ -50,21 +52,19 @@ class _SwapManager:
         self._max_forward = None
         self._max_reverse = None
         self.mining_fee = None
-        self.nostr_started = threading.Event()
-        self.nostr_cancelled = threading.Event()
         self.pairs_updates = 0
         self.pow_calls = 0
-        # by default there is no liquidity to advertise; tests that exercise
-        # publish_now set _max_forward/_max_reverse (or rely on server_update_pairs).
+        self.upstream_nostr_calls = 0
+        # by default there is no liquidity to advertise; tests that exercise the
+        # announce loop set _max_forward/_max_reverse (or flip the flag below).
         self._advertise_liquidity = False
 
     async def run_nostr_server(self):
-        self.nostr_started.set()
-        try:
-            await asyncio.Event().wait()  # block forever until cancelled
-        except asyncio.CancelledError:
-            self.nostr_cancelled.set()
-            raise
+        # The plugin owns the announce loop now (see ANNOUNCE LOOP in
+        # swapserver_gui.py). Reaching this would reintroduce every failure mode
+        # that motivated taking it over, so tests assert it stays at zero.
+        self.upstream_nostr_calls += 1
+        await asyncio.Event().wait()
 
     async def set_nostr_proof_of_work(self):
         self.pow_calls += 1
@@ -80,6 +80,87 @@ class _SwapManager:
 async def _never_finishing_pow(self):
     """Stand-in for ensure_pow_nonce that never opens the gate (still cancellable)."""
     await asyncio.Event().wait()
+
+
+class _TransportRecorder:
+    """Builds NostrTransport stand-ins and records what the announce loop did.
+
+    The loop is expected to *discard and rebuild* transports (that is the only
+    way to recover a relay list aionostr has pruned), so the interesting
+    assertions are about how many were built and whether each connected.
+    """
+
+    def __init__(self, *, connect=True, connect_timeout=0.2):
+        self.connect = connect
+        self.connect_timeout = connect_timeout
+        self.built = 0
+        self.entered = threading.Event()
+        self.torn_down = threading.Event()
+        self.transports = []
+
+    def cls(self):
+        rec = self
+
+        class _FakeTransport:
+            # the plugin also reads these off the class (nostr_match_fields,
+            # build_offer_tags), so they must carry upstream's real values
+            NOSTR_EVENT_VERSION = _RealNostrTransport.NOSTR_EVENT_VERSION
+            USER_STATUS_NIP38 = _RealNostrTransport.USER_STATUS_NIP38
+            OFFER_UPDATE_INTERVAL_SEC = _RealNostrTransport.OFFER_UPDATE_INTERVAL_SEC
+
+            def __init__(self, config, sm, keypair):
+                self.connect_timeout = rec.connect_timeout
+                self.is_connected = asyncio.Event()
+                # what publish_offer_event would reach for
+                self.relay_manager = object()
+                self.nostr_private_key = "nsec1test"
+                self.stopped = False
+                rec.built += 1
+                rec.transports.append(self)
+
+            async def __aenter__(self):
+                if rec.connect:
+                    self.is_connected.set()
+                rec.entered.set()
+                return self
+
+            async def __aexit__(self, *exc):
+                self.stopped = True
+                rec.torn_down.set()
+                return False
+
+            async def stop(self):
+                self.stopped = True
+
+        return _FakeTransport
+
+    def wait_entered(self, timeout=5):
+        return self.entered.wait(timeout=timeout)
+
+
+class _PublishRecorder:
+    """Stand-in for publish_offer_event: records calls, can fail on demand."""
+
+    def __init__(self, *, fail=False):
+        self.fail = fail
+        self.calls = 0
+        self.published = threading.Event()
+
+    async def __call__(self, transport, sm):
+        self.calls += 1
+        self.published.set()
+        if self.fail:
+            raise asyncio.TimeoutError("no relay acknowledged")
+        return f"event-{self.calls}"
+
+    def wait(self, timeout=5):
+        return self.published.wait(timeout=timeout)
+
+    def wait_for_calls(self, n, timeout=5):
+        deadline = time.time() + timeout
+        while self.calls < n and time.time() < deadline:
+            time.sleep(0.02)
+        return self.calls >= n
 
 
 def _make_wallet(sm, *, nostr_keypair=None):
@@ -149,15 +230,19 @@ class CanRunTests(unittest.TestCase):
 class NostrLifecycleTests(unittest.TestCase):
     def test_start_stop_nostr_only(self):
         sm = _SwapManager()
+        sm._advertise_liquidity = True
         config = _Config(port=None, relays="wss://relay.one,wss://relay.two")
         p = _make_plugin(config)
-        p.bind_wallet(_make_wallet(sm))
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
+        rec, pub = _TransportRecorder(), _PublishRecorder()
         with _LoopThread() as loop:
-            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop):
+            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
+                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport", rec.cls()), \
+                 mock.patch("swapserver_gui.swapserver_gui.publish_offer_event", pub):
                 p.start_server()
                 self.assertTrue(p.is_running())
                 self.assertTrue(sm.is_server)
-                self.assertTrue(sm.nostr_started.wait(timeout=5))
+                self.assertTrue(rec.wait_entered())
                 # status reflects nostr transport
                 st = p.status()
                 self.assertTrue(st["nostr_enabled"])
@@ -165,23 +250,26 @@ class NostrLifecycleTests(unittest.TestCase):
                 self.assertFalse(st["http_enabled"])
 
                 p.stop_server()
-                self.assertTrue(sm.nostr_cancelled.wait(timeout=5))
+                self.assertTrue(rec.torn_down.wait(timeout=5))
                 self.assertFalse(p.is_running())
                 self.assertFalse(sm.is_server)
+        self.assertEqual(sm.upstream_nostr_calls, 0)
 
     def test_start_is_idempotent(self):
         sm = _SwapManager()
         p = _make_plugin(_Config(relays="wss://relay.one"))
-        p.bind_wallet(_make_wallet(sm))
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
+        rec = _TransportRecorder()
         with _LoopThread() as loop:
-            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop):
+            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
+                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport", rec.cls()):
                 p.start_server()
-                self.assertTrue(sm.nostr_started.wait(timeout=5))
+                self.assertTrue(rec.wait_entered())
                 first_task = p._nostr_fut
                 p.start_server()  # no-op
                 self.assertIs(p._nostr_fut, first_task)
                 p.stop_server()
-                self.assertTrue(sm.nostr_cancelled.wait(timeout=5))
+                self.assertTrue(rec.torn_down.wait(timeout=5))
 
     def test_start_raises_when_unconfigured(self):
         p = _make_plugin(_Config(port=None, relays=""))
@@ -196,11 +284,13 @@ class NostrLifecycleTests(unittest.TestCase):
         # TimeoutError, crashing the GUI on "Save settings".
         sm = _SwapManager()
         p = _make_plugin(_Config(relays="wss://relay.one"))
-        p.bind_wallet(_make_wallet(sm))
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
+        rec = _TransportRecorder()
         with _LoopThread() as loop:
-            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop):
+            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
+                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport", rec.cls()):
                 p.start_server()
-                self.assertTrue(sm.nostr_started.wait(timeout=5))
+                self.assertTrue(rec.wait_entered())
                 # Occupy the loop so it cannot service new work for ~3s.
                 loop.call_soon_threadsafe(lambda: time.sleep(2))
                 t0 = time.monotonic()
@@ -209,6 +299,32 @@ class NostrLifecycleTests(unittest.TestCase):
                 elapsed = time.monotonic() - t0
                 self.assertLess(elapsed, 1.0, f"restart blocked the caller for {elapsed:.2f}s")
                 self.assertTrue(p.is_running())
+                p.stop_server()
+
+    def test_start_clears_bookkeeping_from_the_previous_run(self):
+        # A restart must not carry the previous run's "last announcement" over:
+        # reporting a stale timestamp as if it belonged to the running server is
+        # the reporting bug this whole loop was written to kill.
+        sm = _SwapManager()
+        p = _make_plugin(_Config(relays="wss://relay.one"))
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
+        rec = _TransportRecorder()
+        with _LoopThread() as loop:
+            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
+                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport", rec.cls()):
+                p.start_server()
+                self.assertTrue(rec.wait_entered())
+                p._last_publish_attempt_at = 1.0
+                p._last_publish_success_at = 2.0
+                p._last_publish_note = "from the previous run"
+                p._consecutive_publish_failures = 7
+                p.stop_server()
+                p.start_server()
+                st = p.status()
+                self.assertIsNone(st["last_publish_attempt_at"])
+                self.assertIsNone(st["last_publish_success_at"])
+                self.assertIsNone(st["last_publish_note"])
+                self.assertEqual(st["consecutive_publish_failures"], 0)
                 p.stop_server()
 
 
@@ -266,7 +382,6 @@ class RequestPairsUpdateTests(unittest.TestCase):
                     time.sleep(0.05)
                 self.assertGreaterEqual(sm.pairs_updates, 1)
                 p.stop_server()
-                self.assertTrue(sm.nostr_cancelled.wait(timeout=5))
 
     def test_update_noop_when_stopped(self):
         sm = _SwapManager()
@@ -279,118 +394,333 @@ class RequestPairsUpdateTests(unittest.TestCase):
                 self.assertEqual(sm.pairs_updates, 0)
 
 
-class PublishNowTests(unittest.TestCase):
-    @staticmethod
-    def _fake_transport_cls(published, *, connect=True):
-        class _FakeTransport:
-            def __init__(self, cfg, sm_, keypair):
-                self.connect_timeout = 1
-                self.is_connected = asyncio.Event()
-                if connect:
-                    self.is_connected.set()
+class AnnounceLoopTests(unittest.TestCase):
+    """The loop that replaced ``SwapManager.run_nostr_server``.
 
-            async def __aenter__(self):
-                return self
+    Everything here is about the one property the old code could not offer: the
+    offer keeps going out, and when it does not, the plugin knows.
+    """
 
-            async def __aexit__(self, *exc):
-                return False
+    def _run(self, *, sm, config, keypair=object(), recorder=None, publisher=None,
+             patches=(), body=None):
+        """Start the server with the announce path faked out, run ``body``, stop."""
+        p = _make_plugin(config)
+        p.bind_wallet(_make_wallet(sm, nostr_keypair=keypair))
+        rec = recorder if recorder is not None else _TransportRecorder()
+        pub = publisher if publisher is not None else _PublishRecorder()
+        with _LoopThread() as loop:
+            stack = [
+                mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop),
+                mock.patch("swapserver_gui.swapserver_gui.NostrTransport", rec.cls()),
+                mock.patch("swapserver_gui.swapserver_gui.publish_offer_event", pub),
+                *patches,
+            ]
+            for ctx in stack:
+                ctx.start()
+            try:
+                p.start_server()
+                body(p, rec, pub)
+            finally:
+                p.stop_server()
+                for ctx in reversed(stack):
+                    ctx.stop()
+        return p
 
-            async def publish_offer(self, sm_):
-                published.set()
-        return _FakeTransport
-
-    def test_start_server_publishes_immediately(self):
-        # Regression: a freshly-started server must announce promptly instead of
-        # waiting for run_nostr_server's first OFFER_UPDATE_INTERVAL_SEC (~10min)
-        # tick, otherwise takers see "no swap providers found" right after boot.
+    # ------------------------------------------------------- announcing at all
+    def test_announces_as_soon_as_the_transport_connects(self):
+        # A freshly-started server must announce promptly rather than waiting a
+        # full tick, otherwise takers see "no swap providers found" after boot.
         sm = _SwapManager()
         sm._advertise_liquidity = True
-        p = _make_plugin(_Config(relays="wss://relay.one"))
-        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
-        published = threading.Event()
-        with _LoopThread() as loop:
-            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
-                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport",
-                            self._fake_transport_cls(published)):
-                p.start_server()
-                self.assertTrue(published.wait(timeout=5))
-                # The plugin owns the proof-of-work now (see pow.py): calling
-                # upstream's set_nostr_proof_of_work from this task would route
-                # into gen_nostr_ann_pow, which wedges the event loop thread if
-                # cancelled mid-grind -- the shutdown-hang bug.
-                self.assertEqual(sm.pow_calls, 0)
-                p.stop_server()
 
-    def test_publish_never_calls_upstream_pow(self):
-        # Explicit regression guard for the shutdown hang: no code path reached
-        # from publish_now may call SwapManager.set_nostr_proof_of_work.
-        sm = _SwapManager()
-        sm._advertise_liquidity = True
-        p = _make_plugin(_Config(relays="wss://relay.one"))
-        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
-        published = threading.Event()
-        with _LoopThread() as loop:
-            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
-                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport",
-                            self._fake_transport_cls(published)):
-                p.start_server()
-                self.assertTrue(published.wait(timeout=5))
-                p.stop_server()
+        def body(p, rec, pub):
+            self.assertTrue(pub.wait())
+            self.assertEqual(p.status()["announce_state"], AnnounceState.ANNOUNCING)
+            self.assertIsNotNone(p.status()["last_publish_success_at"])
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"), body=body)
+        # The plugin owns the proof-of-work (see pow.py): reaching upstream's
+        # set_nostr_proof_of_work would route into gen_nostr_ann_pow, which
+        # wedges the event loop thread if cancelled mid-grind.
         self.assertEqual(sm.pow_calls, 0)
+        self.assertEqual(sm.upstream_nostr_calls, 0)
 
-    def test_publish_waits_for_pow_gate(self):
-        # An announcement made before the PoW is ready carries a nonce that
-        # takers reject, so publishing must wait for the gate to open.
+    def test_waits_for_pow_gate(self):
+        # An announcement made before the PoW is ready carries a nonce takers
+        # reject, so nothing may be published until the gate opens.
         sm = _SwapManager()
         sm._advertise_liquidity = True
-        p = _make_plugin(_Config(relays="wss://relay.one"))
-        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
-        published = threading.Event()
-        with _LoopThread() as loop:
-            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
-                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport",
-                            self._fake_transport_cls(published)), \
-                 mock.patch.object(SwapServerGuiPlugin, "ensure_pow_nonce",
-                                   _never_finishing_pow):
-                p.start_server()
-                self.assertFalse(published.wait(timeout=1.5),
-                                 "announced before the proof-of-work was ready")
-                p.stop_server()
 
-    def test_publish_now_waits_for_liquidity(self):
-        # No liquidity yet -> must not announce until server_update_pairs reports
+        def body(p, rec, pub):
+            self.assertFalse(pub.wait(timeout=1.5),
+                             "announced before the proof-of-work was ready")
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"),
+                  patches=[mock.patch.object(SwapServerGuiPlugin, "ensure_pow_nonce",
+                                             _never_finishing_pow)],
+                  body=body)
+
+    def test_waits_for_liquidity_then_announces(self):
+        # No liquidity yet -> nothing published until server_update_pairs reports
         # some (mirrors channels being funded shortly after the server starts).
         sm = _SwapManager()  # _advertise_liquidity stays False initially
-        p = _make_plugin(_Config(relays="wss://relay.one"))
-        p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
-        published = threading.Event()
-        with _LoopThread() as loop:
-            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop), \
-                 mock.patch("swapserver_gui.swapserver_gui.NostrTransport",
-                            self._fake_transport_cls(published)), \
-                 mock.patch.object(SwapServerGuiPlugin, "PUBLISH_NOW_POLL_SEC", 0.05):
-                p.start_server()
-                self.assertFalse(published.wait(timeout=1))  # no liquidity -> no announce
-                sm._advertise_liquidity = True                # channels get funded
-                self.assertTrue(published.wait(timeout=5))    # now it announces
-                p.stop_server()
+
+        def body(p, rec, pub):
+            self.assertFalse(pub.wait(timeout=1))
+            self.assertEqual(p.status()["announce_state"], AnnounceState.NO_LIQUIDITY)
+            sm._advertise_liquidity = True   # channels get funded
+            self.assertTrue(pub.wait(timeout=5))
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"),
+                  patches=[mock.patch.object(SwapServerGuiPlugin, "LIQUIDITY_POLL_SEC", 0.05)],
+                  body=body)
+
+    def test_no_keypair_never_builds_a_transport(self):
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+
+        def body(p, rec, pub):
+            time.sleep(0.3)
+            self.assertEqual(rec.built, 0)
+            self.assertEqual(pub.calls, 0)
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"), keypair=None,
+                  body=body)
+
+    # ------------------------------------------------------------ re-announcing
+    def test_republishes_on_its_own_schedule(self):
+        # The reported bug: a server that has been up for a long time must keep
+        # re-announcing, because the offer carries a ~10 minute NIP-40 expiry.
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+
+        def body(p, rec, pub):
+            self.assertTrue(pub.wait_for_calls(3, timeout=5),
+                            f"only announced {pub.calls} time(s); the offer would expire")
+            # ...all on one transport: re-announcing must not churn connections.
+            self.assertEqual(rec.built, 1)
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"),
+                  patches=[
+                      mock.patch.object(SwapServerGuiPlugin, "LIQUIDITY_POLL_SEC", 0.05),
+                      mock.patch.object(SwapServerGuiPlugin, "REPUBLISH_INTERVAL_SEC", 0.1),
+                  ],
+                  body=body)
+
+    def test_republishes_immediately_when_the_offer_changes(self):
+        # Upstream's rule, kept: an offer that no longer matches reality is worse
+        # than a slightly late one.
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+
+        def body(p, rec, pub):
+            self.assertTrue(pub.wait_for_calls(1))
+            before = pub.calls
+            sm.mining_fee = 12345          # liquidity/fee change
+            self.assertTrue(pub.wait_for_calls(before + 1, timeout=5))
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"),
+                  patches=[
+                      mock.patch.object(SwapServerGuiPlugin, "LIQUIDITY_POLL_SEC", 0.05),
+                      mock.patch.object(SwapServerGuiPlugin, "REPUBLISH_INTERVAL_SEC", 600),
+                  ],
+                  body=body)
+
+    def test_publish_now_wakes_the_loop(self):
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+
+        def body(p, rec, pub):
+            self.assertTrue(pub.wait_for_calls(1))
+            before = pub.calls
+            p.publish_now()
+            self.assertTrue(pub.wait_for_calls(before + 1, timeout=5))
+            # ...and without building a second transport, which used to mean two
+            # NostrTransports handling the same pubkey's DMs at once.
+            self.assertEqual(rec.built, 1)
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"),
+                  patches=[
+                      mock.patch.object(SwapServerGuiPlugin, "LIQUIDITY_POLL_SEC", 30),
+                      mock.patch.object(SwapServerGuiPlugin, "REPUBLISH_INTERVAL_SEC", 600),
+                  ],
+                  body=body)
 
     def test_publish_now_noop_when_stopped(self):
         sm = _SwapManager()
         p = _make_plugin(_Config(relays="wss://relay.one"))
         p.bind_wallet(_make_wallet(sm, nostr_keypair=object()))
-        self.assertIsNone(p.publish_now())  # not running
+        self.assertIsNone(p.publish_now())  # not running, and must not raise
 
-    def test_publish_now_noop_without_keypair(self):
+    # --------------------------------------------------------------- recovery
+    def test_unreachable_relays_are_retried_with_a_new_transport(self):
+        # aionostr's Manager.connect drops relays that missed its single attempt
+        # and never retries, so the only cure is a brand-new transport. Upstream
+        # instead waits forever on is_connected and never announces again.
         sm = _SwapManager()
         sm._advertise_liquidity = True
-        p = _make_plugin(_Config(relays="wss://relay.one"))
-        p.bind_wallet(_make_wallet(sm, nostr_keypair=None))
-        with _LoopThread() as loop:
-            with mock.patch("swapserver_gui.swapserver_gui.get_asyncio_loop", return_value=loop):
-                p.start_server()  # must not spawn a publish without a keypair
-                self.assertIsNone(p._publish_now_fut)
-                p.stop_server()
+        rec = _TransportRecorder(connect=False, connect_timeout=0.05)
+
+        def body(p, rec_, pub):
+            deadline = time.time() + 5
+            while rec_.built < 2 and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertGreaterEqual(rec_.built, 2,
+                                    "gave up instead of rebuilding the transport")
+            self.assertEqual(p.status()["announce_state"],
+                             AnnounceState.NO_RELAY_CONNECTED)
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"), recorder=rec,
+                  patches=[mock.patch.object(SwapServerGuiPlugin,
+                                             "TRANSPORT_RETRY_MIN_SEC", 0.05)],
+                  body=body)
+
+    def test_unacknowledged_publishes_are_reported_not_hidden(self):
+        # Upstream's publish_offer is @ignore_exceptions and swallows
+        # TimeoutError internally, so a server nobody accepts looks identical to
+        # a healthy one. Recycling is disabled here so the state stays put long
+        # enough to assert on.
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+        pub = _PublishRecorder(fail=True)
+
+        def body(p, rec, pub_):
+            self.assertTrue(pub_.wait_for_calls(2, timeout=5))
+            st = p.status()
+            self.assertEqual(st["announce_state"], AnnounceState.PUBLISH_FAILING)
+            self.assertIsNone(st["last_publish_success_at"])
+            self.assertIsNotNone(st["last_publish_attempt_at"])
+            self.assertIn("TimeoutError", st["last_publish_note"])
+            self.assertGreaterEqual(st["consecutive_publish_failures"], 2)
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"), publisher=pub,
+                  patches=[
+                      mock.patch.object(SwapServerGuiPlugin, "LIQUIDITY_POLL_SEC", 0.05),
+                      mock.patch.object(SwapServerGuiPlugin, "REPUBLISH_INTERVAL_SEC", 0.05),
+                      mock.patch.object(SwapServerGuiPlugin,
+                                        "PUBLISH_FAILURES_BEFORE_RECYCLE", 10_000),
+                  ],
+                  body=body)
+
+    def test_repeated_publish_failures_recycle_the_transport(self):
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+        pub = _PublishRecorder(fail=True)
+
+        def body(p, rec, pub_):
+            deadline = time.time() + 5
+            while rec.built < 2 and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertGreaterEqual(rec.built, 2,
+                                    "kept using a transport no relay answers")
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"), publisher=pub,
+                  patches=[
+                      mock.patch.object(SwapServerGuiPlugin, "LIQUIDITY_POLL_SEC", 0.05),
+                      mock.patch.object(SwapServerGuiPlugin, "REPUBLISH_INTERVAL_SEC", 0.05),
+                      mock.patch.object(SwapServerGuiPlugin, "TRANSPORT_RETRY_MIN_SEC", 0.05),
+                  ],
+                  body=body)
+
+    def test_a_transport_that_cannot_be_built_does_not_kill_the_loop(self):
+        # Building a NostrTransport reads sm.network and the config, either of
+        # which can be missing while a wallet is still loading. An exception
+        # there must not end the loop -- a server whose announce task exited
+        # silently is the state all of this exists to prevent.
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+        rec = _TransportRecorder()
+        real_cls = rec.cls()
+        attempts = []
+
+        class _ExplodingOnce(real_cls):
+            def __init__(self, config, sm_, keypair):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise AttributeError("no attribute 'network'")
+                super().__init__(config, sm_, keypair)
+
+        def body(p, rec_, pub):
+            self.assertTrue(pub.wait(timeout=5),
+                            "the loop died on the first transport failure")
+            self.assertGreaterEqual(len(attempts), 2)
+            self.assertFalse(p.nostr_task_failed())
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"), recorder=rec,
+                  patches=[
+                      mock.patch("swapserver_gui.swapserver_gui.NostrTransport",
+                                 _ExplodingOnce),
+                      mock.patch.object(SwapServerGuiPlugin,
+                                        "TRANSPORT_RETRY_MIN_SEC", 0.05),
+                  ],
+                  body=body)
+
+    def test_a_dead_announce_task_is_visible_and_restarted(self):
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+
+        def body(p, rec, pub):
+            self.assertTrue(pub.wait())
+            # Kill the loop the way an unabsorbed error would.
+            async def _die():
+                raise RuntimeError("boom")
+            p._cancel_fut(p._nostr_fut)
+            p._nostr_fut = p._spawn(_die(), "nostr")
+            deadline = time.time() + 5
+            while not p.nostr_task_failed() and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(p.nostr_task_failed())
+            self.assertEqual(p.status()["announce_state"], AnnounceState.TASK_DEAD)
+            before = rec.built
+            p.supervise()
+            deadline = time.time() + 5
+            while rec.built <= before and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertGreater(rec.built, before, "supervise did not restart the loop")
+            self.assertFalse(p.nostr_task_failed())
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"), body=body)
+
+    def test_supervise_is_throttled(self):
+        # supervise() is driven by a 4s GUI timer; a failure that reproduces on
+        # every start must not be retried several times a minute forever.
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+
+        def body(p, rec, pub):
+            self.assertTrue(pub.wait())
+
+            async def _die():
+                raise RuntimeError("boom")
+
+            for _ in range(3):
+                p._cancel_fut(p._nostr_fut)
+                p._nostr_fut = p._spawn(_die(), "nostr")
+                deadline = time.time() + 5
+                while not p.nostr_task_failed() and time.time() < deadline:
+                    time.sleep(0.02)
+                p.supervise()
+            # only the first of the three restarts is allowed through
+            self.assertTrue(p.nostr_task_failed())
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"),
+                  patches=[mock.patch.object(SwapServerGuiPlugin,
+                                             "NOSTR_RESTART_MIN_INTERVAL_SEC", 60)],
+                  body=body)
+
+    def test_supervise_is_a_noop_while_healthy(self):
+        sm = _SwapManager()
+        sm._advertise_liquidity = True
+
+        def body(p, rec, pub):
+            self.assertTrue(pub.wait())
+            fut = p._nostr_fut
+            for _ in range(3):
+                p.supervise()
+            self.assertIs(p._nostr_fut, fut)
+            self.assertEqual(rec.built, 1)
+
+        self._run(sm=sm, config=_Config(relays="wss://relay.one"), body=body)
 
 
 class SummaryTests(unittest.TestCase):

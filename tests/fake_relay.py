@@ -52,10 +52,15 @@ def event_matches(event: Dict[str, Any], filt: Dict[str, Any]) -> bool:
 class FakeRelay:
     """A relay bound to an ephemeral localhost port. Use as an async context."""
 
-    def __init__(self, *, accept_writes: bool = True) -> None:
+    def __init__(self, *, accept_writes: bool = True, port: int = 0) -> None:
         self.events: List[Dict[str, Any]] = []
         self.accept_writes = accept_writes
         self.reqs: List[List[Any]] = []  # every REQ we were sent, for assertions
+        #: 0 picks an ephemeral port. Pass an explicit one to bind an address a
+        #: test already handed out -- e.g. to start a relay *after* the client
+        #: has been pointed at it, which is how a relay that was down at
+        #: start-up is simulated.
+        self.port = port
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self.url: Optional[str] = None
@@ -72,10 +77,10 @@ class FakeRelay:
         app.add_routes([web.get('/', self._handle)])
         self._runner = web.AppRunner(app)
         await self._runner.setup()
-        self._site = web.TCPSite(self._runner, host='127.0.0.1', port=0)
+        self._site = web.TCPSite(self._runner, host='127.0.0.1', port=self.port)
         await self._site.start()
-        port = self._site._server.sockets[0].getsockname()[1]
-        self.url = f"ws://127.0.0.1:{port}"
+        self.port = self._site._server.sockets[0].getsockname()[1]
+        self.url = f"ws://127.0.0.1:{self.port}"
         return self.url
 
     async def stop(self) -> None:
