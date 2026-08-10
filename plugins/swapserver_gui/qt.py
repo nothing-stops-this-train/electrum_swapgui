@@ -537,6 +537,9 @@ class SwapServerTab(QWidget):
     def refresh(self) -> None:
         if self._timer is None:
             return  # torn down; the wallet/loop may already be gone
+        # Backstop for an announce task that died outright; the loop recovers
+        # from everything else on its own. See SwapServerGuiPlugin.supervise.
+        self.plugin.supervise()
         self.plugin.request_pairs_update()
         st = self.plugin.status()
         running = st["running"]
@@ -567,9 +570,12 @@ class SwapServerTab(QWidget):
         nostr_txt = {
             AnnounceState.DISABLED: _("disabled"),
             AnnounceState.STOPPED: _("{} relay(s) configured").format(st["nostr_relay_count"]),
+            AnnounceState.TASK_DEAD: _("not announcing — task died, restarting"),
             AnnounceState.WAITING_UNLOCK: _("waiting for wallet unlock"),
             AnnounceState.WAITING_POW: _("waiting for proof of work"),
+            AnnounceState.NO_RELAY_CONNECTED: _("not announcing — no relay reachable"),
             AnnounceState.NO_LIQUIDITY: _("not announcing — no liquidity"),
+            AnnounceState.PUBLISH_FAILING: _("not announcing — relays reject the offer"),
             AnnounceState.ANNOUNCING: _("announcing to {} relay(s)").format(st["nostr_relay_count"]),
             # a state added later must degrade, not crash the 4s refresh
         }.get(state, state.value.replace("_", " "))
@@ -636,19 +642,44 @@ class SwapServerTab(QWidget):
                 "<b>" + _("Not announcing") + "</b> — " + state.value.replace("_", " "))
         self.announce_reason.setText(self.plugin.announcement_reason(st))
 
+        # "Attempt" alone used to be the only thing recorded here, and it was
+        # only ever written once per server start -- so a healthy server that had
+        # been up for days reported its last announcement as days old. The
+        # announce loop now owns the publish call, so both numbers are real, and
+        # the one that matters is the *acknowledged* one.
         attempt = st["last_publish_attempt_at"]
+        success = st["last_publish_success_at"]
         note = st["last_publish_note"]
-        if attempt is None and not note:
+        interval = st["republish_interval_sec"]
+        now_ts = time.time()
+        if attempt is None and success is None and not note:
             self.last_publish_label.setText(
-                _("This plugin has not tried to announce yet in this session."))
+                _("This plugin has not announced yet in this session."))
         else:
             parts = []
-            if attempt is not None:
-                parts.append(_("Last announcement attempt by this plugin: {} ago").format(
-                    nostr_check.format_age(int(time.time() - attempt))))
+            if success is not None:
+                parts.append(_("Last announcement accepted by a relay: {} ago").format(
+                    nostr_check.format_age(int(now_ts - success))))
+            if attempt is not None and (success is None or attempt > success + 1):
+                parts.append(_("last attempt {} ago").format(
+                    nostr_check.format_age(int(now_ts - attempt))))
             if note:
                 parts.append(str(note))
             self.last_publish_label.setText(" · ".join(parts))
+        # The offer carries a NIP-40 expiration of ~10 min, so a gap of more than
+        # two re-announce intervals means takers have almost certainly lost us
+        # even if every other indicator still looks healthy.
+        stale = (st["announce_state"] is AnnounceState.ANNOUNCING
+                 and success is not None and now_ts - success > 2 * interval)
+        if stale:
+            self.announce_reason.setText(
+                self.announce_reason.text() + "\n\n" + _(
+                    "⚠ The last acknowledged announcement was {age} ago, which is "
+                    "longer than the {mins} minute re-announce interval. Takers "
+                    "may no longer see this server; check the log and run the "
+                    "discoverability check below.").format(
+                        age=nostr_check.format_age(int(now_ts - success)),
+                        mins=interval // 60))
 
         self._match_labels["net"].setText(st["r_tag"])
         self._match_labels["version"].setText(st["d_tag"])

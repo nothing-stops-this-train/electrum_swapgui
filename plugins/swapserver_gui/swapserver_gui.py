@@ -15,8 +15,6 @@
 #   * The HTTP server (``HttpSwapServer.run``) sets up an aiohttp site and
 #     returns; cancelling that coroutine does not stop the listening socket.
 #     ``ManagedHttpSwapServer`` keeps the ``AppRunner`` so we can shut it down.
-#   * The nostr server (``SwapManager.run_nostr_server``) is a long-running
-#     coroutine that cleans up when cancelled, so for it we just cancel the task.
 #   * Both ``run_nostr_server`` and ``SwapManager.set_nostr_proof_of_work`` route
 #     into ``electrum.util.gen_nostr_ann_pow``, which *deadlocks the event loop
 #     thread* if cancelled while grinding -- and cancelling is exactly what we do
@@ -24,16 +22,23 @@
 #     compute the announcement proof-of-work ourselves (``pow.py``) before
 #     starting the nostr transport, so upstream always finds a good cached nonce
 #     and never enters that function.  See ``pow.py`` for the full analysis.
+#   * We do NOT call ``SwapManager.run_nostr_server``; :meth:`_announce_loop`
+#     below replaces it.  See ``ANNOUNCE LOOP`` for why -- upstream's version can
+#     stop announcing permanently and silently, which is unacceptable for a
+#     server an operator believes is live.
 
 import asyncio
 import concurrent.futures
 import functools
 import importlib
+import json
 import time
 from enum import Enum
 from typing import TYPE_CHECKING, Optional, List, Dict, Any, Tuple
 
 from aiohttp import web
+
+import electrum_aionostr as aionostr
 
 from electrum import constants
 from electrum.i18n import _
@@ -126,9 +131,12 @@ class AnnounceState(Enum):
 
     DISABLED = "disabled"            # no relay configured
     STOPPED = "stopped"              # server not running
+    TASK_DEAD = "task_dead"          # the announce task is gone; nothing publishes
     WAITING_UNLOCK = "waiting_unlock"
     WAITING_POW = "waiting_pow"
+    NO_RELAY_CONNECTED = "no_relay_connected"
     NO_LIQUIDITY = "no_liquidity"
+    PUBLISH_FAILING = "publish_failing"  # connected, but no relay accepts the offer
     ANNOUNCING = "announcing"
 
     @property
@@ -260,38 +268,143 @@ def announce_state(
         min_amount: Optional[int],
         max_forward: Optional[int],
         max_reverse: Optional[int],
+        task_dead: bool = False,
+        relay_connected: bool = True,
+        publish_failing: bool = False,
 ) -> AnnounceState:
     """Classify the announcement path. Pure, so the GUI cannot drift from it.
 
     The order matches the order in which the real code blocks:
-    ``run_nostr_server`` waits for the wallet password *before* it builds a
-    transport, our ``_nostr_startup`` seeds the proof of work before handing
-    over to it, and ``publish_offer`` checks liquidity last.
+    :meth:`SwapServerGuiPlugin._serve_one_transport` waits for the wallet
+    password before it builds a transport, ``_nostr_startup`` seeds the proof of
+    work before handing over to the announce loop, the loop then needs a relay
+    connection, and only then does the liquidity gate apply.
+
+    ``task_dead``/``relay_connected``/``publish_failing`` default to the healthy
+    value so callers that only know the static picture (tests, and any caller
+    predating the announce loop) keep the original five-way classification.
     """
     if not nostr_enabled:
         return AnnounceState.DISABLED
     if not running:
         return AnnounceState.STOPPED
+    if task_dead:
+        return AnnounceState.TASK_DEAD
     if wallet_locked:
         return AnnounceState.WAITING_UNLOCK
     if pow_grinding:
         return AnnounceState.WAITING_POW
+    if not relay_connected:
+        return AnnounceState.NO_RELAY_CONNECTED
     if not has_liquidity_to_announce(min_amount=min_amount,
                                      max_forward=max_forward,
                                      max_reverse=max_reverse):
         return AnnounceState.NO_LIQUIDITY
+    if publish_failing:
+        return AnnounceState.PUBLISH_FAILING
     return AnnounceState.ANNOUNCING
+
+
+# ---------------------------------------------------------------------------
+# The announcement event
+#
+# We build and publish the offer event ourselves rather than calling
+# ``NostrTransport.publish_offer``, for one reason: upstream's method is
+# decorated ``@ignore_exceptions`` *and* swallows ``asyncio.TimeoutError``
+# internally (electrum/submarine_swaps.py), so it returns None whether a relay
+# accepted the event or nothing did.  Owning the call is the only way to know
+# which happened, and "did the last announcement actually land" is precisely the
+# question the Status tab has to answer.
+#
+# The payload and tags below must stay byte-identical to upstream's, because
+# takers filter on the tags and parse the content.  ``test_diagnostics`` pins
+# both against ``NostrTransport``.
+# ---------------------------------------------------------------------------
+
+def build_offer_payload(sm: 'SwapManager') -> Dict[str, Any]:
+    """The announcement content, exactly as ``publish_offer`` composes it."""
+    return {
+        # cast to float for <= 4.7.1 backwards compatibility, as upstream does
+        'percentage_fee': float(sm.percentage),
+        'mining_fee': sm.mining_fee,
+        'min_amount': sm._min_amount,
+        'max_forward_amount': sm._max_forward,
+        'max_reverse_amount': sm._max_reverse,
+        'relays': sm.config.NOSTR_RELAYS,
+        'pow_nonce': hex(sm.config.SWAPSERVER_ANN_POW_NONCE),
+    }
+
+
+def build_offer_tags(*, now_ts: int) -> List[List[str]]:
+    """The announcement tags, exactly as ``publish_offer`` composes them.
+
+    The ``expiration`` (NIP-40) window stays upstream's
+    ``OFFER_UPDATE_INTERVAL_SEC + 10`` even though we republish far more often:
+    the fix for the expiry gap is the shorter *cadence*
+    (:attr:`SwapServerGuiPlugin.REPUBLISH_INTERVAL_SEC`), not a longer window.
+    Each republish carries a fresh expiration, so the offer is now refreshed at
+    roughly half its lifetime instead of right at the end of it.
+    """
+    return [['d', f'electrum-swapserver-{NostrTransport.NOSTR_EVENT_VERSION}'],
+            ['r', 'net:' + constants.net.NET_NAME],
+            ['expiration',
+             str(now_ts + NostrTransport.OFFER_UPDATE_INTERVAL_SEC + 10)]]
+
+
+async def publish_offer_event(transport: 'NostrTransport', sm: 'SwapManager') -> str:
+    """Publish one swap offer; return the id of the event a relay acknowledged.
+
+    Raises ``asyncio.TimeoutError`` when no relay acknowledged in time --
+    ``aionostr.Manager.add_event`` resolves on the first OK and gives up after
+    ``connect_timeout``.  A relay list that has been emptied (see
+    :meth:`SwapServerGuiPlugin._serve_one_transport`) also lands here, because
+    there is then nothing to wait for.
+    """
+    return await aionostr._add_event(
+        transport.relay_manager,
+        kind=NostrTransport.USER_STATUS_NIP38,
+        tags=build_offer_tags(now_ts=int(time.time())),
+        content=json.dumps(build_offer_payload(sm)),
+        private_key=transport.nostr_private_key)
 
 
 class SwapServerGuiPlugin(BasePlugin):
     """Owns the swap-server lifecycle. The Qt layer subclasses this."""
 
-    # publish_now() waits (bounded) for the server to actually have liquidity to
-    # advertise before announcing. A server that just started may have no open
-    # channels yet (e.g. on a fresh regtest rig the channels are funded shortly
-    # after the server comes up); without this it would announce nothing.
-    PUBLISH_NOW_LIQUIDITY_WAIT_SEC = 180
-    PUBLISH_NOW_POLL_SEC = 3
+    #: How often the announce loop re-publishes an unchanged offer.  Upstream
+    #: uses OFFER_UPDATE_INTERVAL_SEC (600s) against a NIP-40 expiration of
+    #: 610s, checked on a 30s tick and re-stamped only *after* the publish
+    #: returns -- so the real period is 600-630s plus latency and drifts later
+    #: every cycle, leaving the offer expired on strict relays for part of each
+    #: cycle.  Refreshing at half the window removes that gap entirely.
+    REPUBLISH_INTERVAL_SEC = 300
+
+    #: Tick of the announce loop: how often liquidity/mining fees are recomputed
+    #: and compared, matching upstream's LIQUIDITY_UPDATE_INTERVAL_SEC.  A server
+    #: that just started may have no open channels yet, so the loop simply keeps
+    #: ticking until there is something to advertise.
+    LIQUIDITY_POLL_SEC = 30
+
+    #: Rebuild the transport this often even when nothing is wrong.
+    #: ``aionostr.Manager.connect`` drops every relay that did not answer its one
+    #: connection attempt (``self.relays = connected``) and is guarded by
+    #: ``if not self.connected``, so it never runs again -- a relay that was down
+    #: at start-up stays dropped for the life of the transport.  A fresh
+    #: transport is the only way to get it back.
+    TRANSPORT_RECYCLE_SEC = 3600
+
+    #: Rebuild early once this many consecutive publishes go unacknowledged.
+    PUBLISH_FAILURES_BEFORE_RECYCLE = 3
+
+    #: Backoff bounds for rebuilding the transport after a failure.
+    TRANSPORT_RETRY_MIN_SEC = 5
+    TRANSPORT_RETRY_MAX_SEC = 300
+
+    #: How often to re-check a password-protected wallet for being unlocked.
+    WALLET_UNLOCK_POLL_SEC = 10
+
+    #: Floor on how often :meth:`supervise` may resurrect a dead announce task.
+    NOSTR_RESTART_MIN_INTERVAL_SEC = 30
 
     def __init__(self, parent: Any, config: 'SimpleConfig', name: str) -> None:
         BasePlugin.__init__(self, parent, config, name)
@@ -299,7 +412,6 @@ class SwapServerGuiPlugin(BasePlugin):
         self._sm: Optional['SwapManager'] = None
         self._http_fut: Optional['concurrent.futures.Future'] = None
         self._nostr_fut: Optional['concurrent.futures.Future'] = None
-        self._publish_now_fut: Optional['concurrent.futures.Future'] = None
         self._running: bool = False
         # The swap manager whose server_create_* methods we wrapped, if any.
         self._recorded_sm: Optional['SwapManager'] = None
@@ -309,13 +421,23 @@ class SwapServerGuiPlugin(BasePlugin):
         self._pow_gate: asyncio.Event = asyncio.Event()
         self._pow_state: Optional['swap_pow.PowState'] = None
         self._pow_grinding: bool = False
-        # Bookkeeping for the announcements *we* trigger (publish_now). Upstream's
-        # run_nostr_server keeps its transport private and publish_offer is
-        # decorated with @ignore_exceptions, so neither its schedule nor its
-        # success is observable from here -- which is exactly why the Diagnostics
-        # pane asks the relays instead of trusting local state.
+        # Bookkeeping for the announce loop. Because we own the publish call
+        # (see publish_offer_event) these are the real thing: _attempt_at is
+        # stamped before every send, _success_at only when a relay acknowledged
+        # the event. The Diagnostics check still exists to answer the one
+        # question local state cannot -- whether a taker's *filter* matches.
         self._last_publish_attempt_at: Optional[float] = None
+        self._last_publish_success_at: Optional[float] = None
         self._last_publish_note: Optional[str] = None
+        self._consecutive_publish_failures: int = 0
+        # None until the loop has tried to connect at least once.
+        self._relay_connected: Optional[bool] = None
+        # Set (threadsafely) to make the announce loop publish on its next tick.
+        self._publish_wakeup: asyncio.Event = asyncio.Event()
+        # The transport the announce loop is currently using, so stop_server can
+        # tear it down even when cancellation cuts __aexit__ short.
+        self._live_transport: Optional['NostrTransport'] = None
+        self._last_nostr_restart_at: Optional[float] = None
         self._check_fut: Optional['concurrent.futures.Future'] = None
 
     # ------------------------------------------------------------------ utils
@@ -569,17 +691,214 @@ class SwapServerGuiPlugin(BasePlugin):
         self.logger.info(f"found nostr announcement proof-of-work: {result.bits} bits")
         return True
 
-    async def _nostr_startup(self) -> None:
-        """Compute the PoW ourselves, then hand over to upstream's nostr server.
+    # -------------------------------------------------------- ANNOUNCE LOOP
+    #
+    # This replaces ``SwapManager.run_nostr_server``.  That coroutine has four
+    # failure modes that all end in "the server is silently invisible", which is
+    # the worst outcome an operator can have, and none of them are observable or
+    # recoverable from outside it (electrum/submarine_swaps.py):
+    #
+    #   1. it blocks on ``await transport.is_connected.wait()`` with no timeout.
+    #      ``is_connected`` is set exactly once, in ``NostrTransport.main_loop``,
+    #      and only if ``relay_manager.connect()`` returned at least one live
+    #      relay.  If every relay happens to be unreachable at that moment --
+    #      Electrum starting before the network is up, Tor not ready yet, a
+    #      resume from suspend -- the wait never completes.  ``run_nostr_server``
+    #      then hangs for the whole process lifetime, and so does
+    #      ``check_direct_messages``, so the server also stops answering swap
+    #      requests over nostr.  Nothing retries the connection.
+    #   2. relays that failed that single attempt are removed from the manager
+    #      permanently (``Manager.connect``: ``self.relays = connected``), so a
+    #      momentary blip silently degrades a five-relay server to one relay.
+    #   3. it republishes right at the NIP-40 expiry instead of inside it; see
+    #      :attr:`REPUBLISH_INTERVAL_SEC`.
+    #   4. neither the attempt nor its outcome is reportable, because
+    #      ``publish_offer`` is ``@ignore_exceptions``.
+    #
+    # Owning the loop makes all four fixable, and is the same trade this plugin
+    # already made for the proof of work.  The transport itself is still
+    # upstream's, so ``check_direct_messages`` and ``_handle_requests`` -- the
+    # nostr side of actually serving swaps -- are unchanged: they are spawned by
+    # ``NostrTransport.main_loop`` because ``sm.is_server`` is True.
 
-        Ordering matters: ``run_nostr_server`` begins with
-        ``set_nostr_proof_of_work``, which grinds inside the un-cancellable
-        upstream helper.  By seeding a good nonce first we guarantee it
-        short-circuits, so cancelling this task at shutdown is always safe.
+    async def _nostr_startup(self) -> None:
+        """Seed the proof of work, then run the announce loop.
+
+        Ordering matters: anything that reaches upstream's
+        ``set_nostr_proof_of_work`` grinds inside the un-cancellable helper in
+        ``electrum.util``.  Seeding a good nonce first guarantees nothing does,
+        so cancelling this task at shutdown is always safe.
         """
         await self.ensure_pow_nonce()
-        assert self._sm is not None
-        await self._sm.run_nostr_server()
+        await self._announce_loop()
+
+    async def _announce_loop(self) -> None:
+        """Keep a connected nostr transport alive and the offer fresh, forever.
+
+        Never returns except by cancellation: every error path rebuilds the
+        transport after a backoff, because a fresh transport is the only way to
+        recover a relay list that ``Manager.connect`` has pruned.
+        """
+        delay = float(self.TRANSPORT_RETRY_MIN_SEC)
+        while True:
+            try:
+                made_progress = await self._serve_one_transport()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Nothing may end this loop except cancellation: a server whose
+                # announce task has silently exited is exactly the state this
+                # code exists to prevent. supervise() is only the backstop.
+                self.logger.warning("nostr announce: unexpected error; retrying",
+                                    exc_info=True)
+                made_progress = False
+            if made_progress:
+                delay = float(self.TRANSPORT_RETRY_MIN_SEC)
+            else:
+                self.logger.info(
+                    f"nostr announce: retrying with a new transport in {delay:.0f}s")
+            await asyncio.sleep(delay)
+            if not made_progress:
+                delay = min(delay * 2, float(self.TRANSPORT_RETRY_MAX_SEC))
+
+    async def _serve_one_transport(self) -> bool:
+        """Build a transport, announce through it until it should be recycled.
+
+        Returns True when the transport was useful (it connected and published
+        at least once), which is what resets the retry backoff.
+        """
+        sm = self._sm
+        if sm is None or self.wallet is None or self.wallet.lnworker is None:
+            return False
+        keypair = getattr(self.wallet.lnworker, "nostr_keypair", None)
+        if keypair is None:
+            # Upstream would fail the same way; say so instead of spinning.
+            self.logger.warning("no nostr keypair; cannot announce")
+            self._last_publish_note = "this wallet has no nostr key"
+            return False
+        # Mirrors run_nostr_server: no transport at all until the wallet is
+        # unlocked, because the offer is signed with a key derived from the seed.
+        while self.wallet_is_locked():
+            self.logger.info("wallet is locked; waiting to announce over nostr")
+            await asyncio.sleep(self.WALLET_UNLOCK_POLL_SEC)
+
+        useful = False
+        try:
+            # Inside the try: building the transport reads sm.network and the
+            # config, either of which can be missing or half-initialised while
+            # a wallet is loading.
+            transport = NostrTransport(self.config, sm, keypair)
+            self._live_transport = transport
+            async with transport:
+                try:
+                    await asyncio.wait_for(transport.is_connected.wait(),
+                                           timeout=transport.connect_timeout + 1)
+                except asyncio.TimeoutError:
+                    self._relay_connected = False
+                    self._last_publish_note = "no relay connected"
+                    self.logger.warning(
+                        "nostr announce: no relay connected; discarding this "
+                        "transport so the relay list is rebuilt")
+                    return False
+                self._relay_connected = True
+                self.logger.info("nostr announce: transport connected")
+                useful = await self._announce_until_recycle(transport)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._last_publish_note = f"transport error: {type(e).__name__}: {e}"
+            self.logger.warning("nostr announce: transport failed", exc_info=True)
+        finally:
+            self._relay_connected = False
+            self._live_transport = None
+        return useful
+
+    async def _announce_until_recycle(self, transport: 'NostrTransport') -> bool:
+        """Publish on this transport until it is time to build a new one.
+
+        Publishes when the offer would otherwise go stale, when the advertised
+        numbers change (upstream's rule), or when :meth:`publish_now` asks.
+        """
+        sm = self._sm
+        assert sm is not None
+        loop = asyncio.get_running_loop()
+        built_at = loop.time()
+        last_publish_at: Optional[float] = None
+        published_at_least_once = False
+        previous = self._advertised_values(sm)
+        forced = True  # announce as soon as we are connected, not one tick later
+        while True:
+            try:
+                sm.server_update_pairs()
+            except Exception:
+                self.logger.debug("server_update_pairs failed in the announce loop",
+                                  exc_info=True)
+            current = self._advertised_values(sm)
+            changed = current != previous
+            previous = current
+            now_mono = loop.time()
+            due = (forced or last_publish_at is None or changed
+                   or now_mono - last_publish_at >= self.REPUBLISH_INTERVAL_SEC)
+            if due and has_liquidity_to_announce(min_amount=sm._min_amount,
+                                                 max_forward=sm._max_forward,
+                                                 max_reverse=sm._max_reverse):
+                last_publish_at = now_mono
+                if await self._publish_once(transport):
+                    published_at_least_once = True
+                if self._consecutive_publish_failures >= self.PUBLISH_FAILURES_BEFORE_RECYCLE:
+                    self.logger.warning(
+                        f"nostr announce: {self._consecutive_publish_failures} "
+                        f"publishes in a row went unacknowledged; rebuilding the "
+                        f"transport")
+                    return published_at_least_once
+            if loop.time() - built_at >= self.TRANSPORT_RECYCLE_SEC:
+                self.logger.debug("nostr announce: recycling the transport on schedule")
+                return published_at_least_once
+            forced = await self._wait_for_tick(self.LIQUIDITY_POLL_SEC)
+
+    @staticmethod
+    def _advertised_values(sm: 'SwapManager') -> Tuple[Any, Any, Any]:
+        """The parts of the offer whose change forces an immediate re-announce.
+
+        Same triple upstream compares (``liquidity_changed``/
+        ``mining_fees_changed``); an offer that no longer matches reality is
+        worse than a slightly late one.
+        """
+        return (sm._max_forward, sm._max_reverse, sm.mining_fee)
+
+    async def _wait_for_tick(self, seconds: float) -> bool:
+        """Sleep for ``seconds``, or wake early if :meth:`publish_now` fired.
+
+        Returns True when it was woken early, i.e. an announcement was requested.
+        """
+        try:
+            await asyncio.wait_for(self._publish_wakeup.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return False
+        self._publish_wakeup.clear()
+        return True
+
+    async def _publish_once(self, transport: 'NostrTransport') -> bool:
+        """Send one offer; record whether a relay acknowledged it."""
+        sm = self._sm
+        assert sm is not None
+        self._last_publish_attempt_at = time.time()
+        try:
+            event_id = await publish_offer_event(transport, sm)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._consecutive_publish_failures += 1
+            self._last_publish_note = f"failed: {type(e).__name__}: {e}"
+            self.logger.warning(
+                f"nostr announce: publish failed "
+                f"({self._consecutive_publish_failures} in a row): {e!r}")
+            return False
+        self._consecutive_publish_failures = 0
+        self._last_publish_success_at = time.time()
+        self._last_publish_note = "accepted by a relay"
+        self.logger.info(f"nostr announce: published offer {event_id}")
+        return True
 
     # -------------------------------------------------------------- lifecycle
     def bind_wallet(self, wallet: 'Abstract_Wallet') -> None:
@@ -618,112 +937,84 @@ class SwapServerGuiPlugin(BasePlugin):
         port = self.config.SWAPSERVER_PORT
         relays = (self.config.NOSTR_RELAYS or "").strip()
         self._pow_gate = asyncio.Event()  # fresh gate for this run
+        # Nothing from a previous run may be reported as if it belonged to this
+        # one; a stale "last announcement" is exactly the bug this all started as.
+        self._last_publish_attempt_at = None
+        self._last_publish_success_at = None
+        self._last_publish_note = None
+        self._consecutive_publish_failures = 0
+        self._relay_connected = None
+        self._publish_wakeup = asyncio.Event()
+        self._last_nostr_restart_at = None
 
         if port:
             server = ManagedHttpSwapServer(self.config, self.wallet)
             sm.http_server = server
             self._http_fut = self._spawn(server.run(), "http")
         if relays:
-            # _nostr_startup seeds the proof-of-work before starting upstream's
-            # nostr server; see the note in the module docstring.
+            # _nostr_startup seeds the proof-of-work, then runs our own announce
+            # loop in place of SwapManager.run_nostr_server; see ANNOUNCE LOOP.
+            # It publishes as soon as the transport connects, so there is no
+            # separate "announce on startup" step to schedule here.
             self._nostr_fut = self._spawn(self._nostr_startup(), "nostr")
 
         self._running = True
         self.logger.info(f"swap server started (http_port={port or None}, "
                           f"nostr_relays={len(relays.split(',')) if relays else 0})")
 
-        # Announce immediately instead of waiting for run_nostr_server's first
-        # OFFER_UPDATE_INTERVAL_SEC (~10 min) tick, so takers can discover us
-        # right after start-up. No-op when no nostr relay is configured.
-        if relays:
-            self.publish_now()
+    def publish_now(self) -> None:
+        """Ask the announce loop to publish on its next tick (non-blocking).
 
-    def publish_now(self) -> Optional['concurrent.futures.Future']:
-        """Force an immediate swap announcement over nostr (non-blocking).
-
-        Safe to call from the Qt GUI thread; returns at once (the work runs on
-        the asyncio loop). Useful both as an explicit "announce now" action and,
-        internally, right after :meth:`start_server` so we don't wait for
-        ``run_nostr_server``'s first ``OFFER_UPDATE_INTERVAL_SEC`` tick. No-op
-        unless the server is running with at least one nostr relay configured.
+        Safe to call from the Qt GUI thread. This no longer spins up a transport
+        of its own: doing that while the long-lived one was up meant two
+        ``NostrTransport`` instances subscribed to the same pubkey's DMs, both
+        running ``_handle_requests``, with the short-lived one able to pick up a
+        taker's request and then be torn down mid-flight.
         """
         if not self._running:
-            return None
+            return
         if not (self.config.NOSTR_RELAYS or "").strip():
-            return None
+            return
         if self._sm is None or self.wallet is None or self.wallet.lnworker is None:
-            return None
+            return
         if getattr(self.wallet.lnworker, "nostr_keypair", None) is None:
-            return None
-        self._publish_now_fut = self._spawn(self._one_shot_publish(), "publish-now")
-        return self._publish_now_fut
+            return
+        self._loop().call_soon_threadsafe(self._publish_wakeup.set)
 
-    async def _one_shot_publish(self) -> None:
-        """Publish a single announcement using a short-lived NostrTransport.
+    # ------------------------------------------------------------ supervision
+    def nostr_task_failed(self) -> bool:
+        """True when the announce task ended by itself while the server runs.
 
-        ``run_nostr_server`` keeps its transport private, so we spin up our own
-        (same pattern as the client's ``get_submarine_swap_providers``) with the
-        server's nostr keypair, wait until there is liquidity to advertise, emit
-        one offer, and tear it down. ``publish_offer`` refuses to announce when
-        there is no liquidity, so we poll ``server_update_pairs`` up to
-        :attr:`PUBLISH_NOW_LIQUIDITY_WAIT_SEC` before giving up.
+        :meth:`_announce_loop` only ends by cancellation, so this means it hit
+        something the loop could not absorb (or ``ensure_pow_nonce`` raised).
+        Either way nothing is being announced and the GUI must not claim
+        otherwise.
         """
-        sm = self._sm
-        if sm is None or self.wallet is None or self.wallet.lnworker is None:
+        fut = self._nostr_fut
+        return bool(self._running and fut is not None
+                    and fut.done() and not fut.cancelled())
+
+    def supervise(self) -> None:
+        """Restart the announce task if it died. Cheap; call it periodically.
+
+        The loop absorbs its own errors, so this is a backstop rather than the
+        primary recovery path -- but "the plugin says Announcing while nothing
+        announces" must not be reachable, and a dead task is the one way to get
+        there that the loop itself cannot fix.
+
+        Throttled, because the caller is a GUI timer: a failure that reproduces
+        on every start (``ensure_pow_nonce`` raising, say) would otherwise be
+        retried several times a minute forever.
+        """
+        if not self.nostr_task_failed():
             return
-        keypair = getattr(self.wallet.lnworker, "nostr_keypair", None)
-        if keypair is None:
+        now_ts = time.time()
+        if (self._last_nostr_restart_at is not None
+                and now_ts - self._last_nostr_restart_at < self.NOSTR_RESTART_MIN_INTERVAL_SEC):
             return
-        # Wait for the announcement proof-of-work instead of computing one here.
-        # We must NOT call sm.set_nostr_proof_of_work(): it routes into
-        # electrum.util.gen_nostr_ann_pow, which wedges the event loop thread if
-        # this task is cancelled mid-grind. _nostr_startup owns the PoW and
-        # opens the gate; that path is cancel-safe. Waiting here is cancellable.
-        await self._pow_gate.wait()
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.PUBLISH_NOW_LIQUIDITY_WAIT_SEC
-        while True:
-            try:
-                sm.server_update_pairs()
-            except Exception:
-                self.logger.debug("server_update_pairs failed in publish_now",
-                                  exc_info=True)
-            min_amount = sm._min_amount or 0
-            have_liquidity = min_amount > 0 and (
-                (sm._max_forward or 0) >= min_amount
-                or (sm._max_reverse or 0) >= min_amount)
-            if have_liquidity:
-                break
-            if loop.time() >= deadline:
-                self.logger.info("publish_now: no liquidity to advertise within "
-                                 f"{self.PUBLISH_NOW_LIQUIDITY_WAIT_SEC}s; skipping")
-                self._last_publish_note = (
-                    f"gave up after {self.PUBLISH_NOW_LIQUIDITY_WAIT_SEC}s: "
-                    f"no liquidity to advertise")
-                return
-            await asyncio.sleep(self.PUBLISH_NOW_POLL_SEC)
-        transport = NostrTransport(self.config, sm, keypair)
-        try:
-            async with transport:
-                try:
-                    await asyncio.wait_for(transport.is_connected.wait(),
-                                           timeout=transport.connect_timeout + 1)
-                except asyncio.TimeoutError:
-                    self.logger.info("publish_now: no relay connected; "
-                                     "skipping immediate announcement")
-                    self._last_publish_note = "no relay connected"
-                    return
-                self._last_publish_attempt_at = time.time()
-                # publish_offer is decorated with @ignore_exceptions upstream, so
-                # returning normally is NOT proof that a relay accepted the
-                # event. Only the Diagnostics check can confirm that.
-                await transport.publish_offer(sm)
-                self._last_publish_note = "announcement sent to relays"
-                self.logger.info("publish_now: immediate swap announcement published")
-        except Exception as e:
-            self._last_publish_note = f"failed: {type(e).__name__}: {e}"
-            self.logger.warning("publish_now: immediate announcement failed",
-                                exc_info=True)
+        self._last_nostr_restart_at = now_ts
+        self.logger.warning("nostr announce task had died; restarting it")
+        self._nostr_fut = self._spawn(self._nostr_startup(), "nostr")
 
     def stop_server(self) -> None:
         """Stop all server transports. Idempotent."""
@@ -746,24 +1037,45 @@ class SwapServerGuiPlugin(BasePlugin):
             sm.http_server = None
         self._cancel_fut(self._http_fut)
         self._cancel_fut(self._nostr_fut)
-        self._cancel_fut(self._publish_now_fut)
         self._http_fut = None
         self._nostr_fut = None
-        self._publish_now_fut = None
+        # Cancelling the announce task cuts NostrTransport.__aexit__ short (it
+        # awaits transport.stop(), which cannot complete once the task is being
+        # cancelled), so the relay websockets would leak until the process
+        # exits. Tear the transport down separately, fire-and-forget.
+        transport = self._live_transport
+        self._live_transport = None
+        if transport is not None:
+            self._spawn(self._shutdown_transport(transport), "nostr-stop")
         if sm is not None:
             sm.is_server = False
         self._remove_served_swap_recorder()
         self._running = False
         self._pow_grinding = False
+        self._relay_connected = None
         self.logger.info("swap server stopped")
+
+    async def _shutdown_transport(self, transport: 'NostrTransport') -> None:
+        """Close a nostr transport, tolerating a partly-built or already-closed one.
+
+        ``NostrTransport.stop`` is ``@log_exceptions`` (it re-raises) and touches
+        ``relay_manager`` unconditionally, which is None if ``main_loop`` never
+        got that far. Running it twice is also possible, when ``__aexit__`` did
+        manage to complete before we got here.
+        """
+        try:
+            await transport.stop()
+        except Exception:
+            self.logger.debug("nostr transport shutdown failed", exc_info=True)
 
     # ------------------------------------------------------------ diagnostics
     def wallet_is_locked(self) -> bool:
-        """True while ``run_nostr_server`` would be stuck waiting for a password.
+        """True while the announce loop is waiting for the wallet password.
 
-        Upstream loops on exactly this condition before it builds a transport
-        (electrum/submarine_swaps.py, ``run_nostr_server``), so a password-
-        protected wallet that was never unlocked announces nothing at all.
+        :meth:`_serve_one_transport` loops on exactly this condition before it
+        builds a transport, as upstream's ``run_nostr_server`` does, because the
+        offer is signed with a key derived from the seed: a password-protected
+        wallet that was never unlocked announces nothing at all.
         """
         wallet = self.wallet
         if wallet is None:
@@ -858,6 +1170,9 @@ class SwapServerGuiPlugin(BasePlugin):
         data["nostr_npub"] = identity[1] if identity else None
         data.update(self.nostr_match_fields())
         data["wallet_locked"] = self.wallet_is_locked()
+        data["nostr_task_dead"] = self.nostr_task_failed()
+        data["relay_connected"] = self._relay_connected
+        data["consecutive_publish_failures"] = self._consecutive_publish_failures
         data["announce_state"] = announce_state(
             running=self._running,
             nostr_enabled=bool(relays),
@@ -866,6 +1181,11 @@ class SwapServerGuiPlugin(BasePlugin):
             min_amount=data["min_amount"],
             max_forward=data["max_forward"],
             max_reverse=data["max_reverse"],
+            task_dead=data["nostr_task_dead"],
+            # None means "the loop has not tried yet", which is a start-up
+            # moment rather than a fault: do not flag it as disconnected.
+            relay_connected=self._relay_connected is not False,
+            publish_failing=self._consecutive_publish_failures > 0,
         )
         # What the announcement would actually carry, as opposed to the target.
         pubkey = self._nostr_pubkey()
@@ -875,7 +1195,9 @@ class SwapServerGuiPlugin(BasePlugin):
         data["pow_default_taker_target"] = nostr_check.DEFAULT_TAKER_POW_TARGET
         data["min_swap_amount"] = MIN_SWAP_AMOUNT_SAT
         data["last_publish_attempt_at"] = self._last_publish_attempt_at
+        data["last_publish_success_at"] = self._last_publish_success_at
         data["last_publish_note"] = self._last_publish_note
+        data["republish_interval_sec"] = self.REPUBLISH_INTERVAL_SEC
         return data
 
     def announcement_reason(self, st: Optional[Dict[str, Any]] = None) -> str:
@@ -887,6 +1209,18 @@ class SwapServerGuiPlugin(BasePlugin):
             return "No nostr relay is configured, so nothing is announced."
         if state is AnnounceState.STOPPED:
             return "The swap server is stopped."
+        if state is AnnounceState.TASK_DEAD:
+            return ("The announcement task stopped unexpectedly, so nothing is "
+                    "being published. It will be restarted automatically; see "
+                    "the log for what happened.")
+        if state is AnnounceState.NO_RELAY_CONNECTED:
+            return ("Not announcing: no nostr relay is reachable. A new "
+                    "connection is retried with a growing backoff, which also "
+                    "restores relays that were unreachable at start-up.")
+        if state is AnnounceState.PUBLISH_FAILING:
+            return ("Not announcing: the offer is being sent but no relay is "
+                    "acknowledging it. After a few failures the connection is "
+                    "rebuilt from scratch.")
         if state is AnnounceState.WAITING_UNLOCK:
             return ("Waiting for the wallet password. Electrum does not start "
                     "the nostr announcement until the wallet is unlocked.")
@@ -900,8 +1234,10 @@ class SwapServerGuiPlugin(BasePlugin):
                     f"{min_amount:,} sat. Max forward is capped by lightning "
                     f"inbound capacity AND the on-chain balance; max reverse by "
                     f"lightning outbound capacity.")
-        return ("Announcing. Use the discoverability check below to confirm the "
-                "relays are actually serving the offer to takers.")
+        return (f"Announcing, and re-announcing every "
+                f"{st.get('republish_interval_sec', self.REPUBLISH_INTERVAL_SEC) // 60} "
+                f"minutes. Use the discoverability check below to confirm the "
+                f"relays are actually serving the offer to takers.")
 
     def cancel_discovery_check(self) -> None:
         self._cancel_fut(self._check_fut)

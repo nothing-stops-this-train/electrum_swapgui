@@ -33,7 +33,7 @@ from electrum_aionostr.util import from_nip19  # noqa: E402
 
 from swapserver_gui.swapserver_gui import (  # noqa: E402
     AnnounceState, SwapServerGuiPlugin, SwapServerError, announce_state,
-    has_liquidity_to_announce,
+    build_offer_payload, build_offer_tags, has_liquidity_to_announce,
 )
 from swapserver_gui import nostr_check as nc  # noqa: E402
 
@@ -162,6 +162,110 @@ class TestAnnounceState(unittest.TestCase):
         self.assertIs(self.state(pow_grinding=True, max_forward=0, max_reverse=0),
                       AnnounceState.WAITING_POW)
 
+    # -- states the announce loop reports ----------------------------------
+    # Each of these used to be indistinguishable from ANNOUNCING, which is the
+    # worst possible answer: the operator believes the server is discoverable.
+
+    def test_dead_announce_task(self):
+        self.assertIs(self.state(task_dead=True), AnnounceState.TASK_DEAD)
+
+    def test_no_relay_connected(self):
+        self.assertIs(self.state(relay_connected=False),
+                      AnnounceState.NO_RELAY_CONNECTED)
+        self.assertFalse(self.state(relay_connected=False).is_announcing)
+
+    def test_publish_failing(self):
+        self.assertIs(self.state(publish_failing=True),
+                      AnnounceState.PUBLISH_FAILING)
+        self.assertFalse(self.state(publish_failing=True).is_announcing)
+
+    def test_loop_health_defaults_to_the_healthy_answer(self):
+        # Callers that predate the announce loop keep the original five-way
+        # classification rather than being told the server is broken.
+        self.assertIs(self.state(), AnnounceState.ANNOUNCING)
+
+    def test_loop_health_precedence(self):
+        # A dead task outranks everything except "not configured / not running":
+        # nothing else can be true while nothing is running the loop.
+        self.assertIs(self.state(task_dead=True, wallet_locked=True,
+                                 pow_grinding=True, relay_connected=False,
+                                 publish_failing=True),
+                      AnnounceState.TASK_DEAD)
+        self.assertIs(self.state(running=False, task_dead=True),
+                      AnnounceState.STOPPED)
+        # A missing relay is diagnosed before liquidity, because the loop needs
+        # a connection before the liquidity gate is ever consulted.
+        self.assertIs(self.state(relay_connected=False, max_forward=0,
+                                 max_reverse=0, publish_failing=True),
+                      AnnounceState.NO_RELAY_CONNECTED)
+        # ...and no liquidity before failing publishes, because with nothing to
+        # advertise there is no publish to fail.
+        self.assertIs(self.state(max_forward=0, max_reverse=0,
+                                 publish_failing=True),
+                      AnnounceState.NO_LIQUIDITY)
+
+
+class TestOfferEvent(unittest.TestCase):
+    """The announcement we build must stay byte-compatible with upstream's.
+
+    The plugin composes and sends the offer itself (``publish_offer_event``)
+    because upstream's ``publish_offer`` cannot report whether a relay accepted
+    it.  The price of that is drift risk: if upstream changes the payload or the
+    tags, takers stop understanding us.  These tests are the tripwire.
+    """
+
+    def _sm(self):
+        sm = _SwapManager()
+        sm.config = _Config(relays="wss://a,wss://b", nonce=0x1234)
+        sm.percentage = 0.5
+        sm.mining_fee = 1000
+        sm._min_amount = 20000
+        sm._max_forward = 150000
+        sm._max_reverse = 120000
+        return sm
+
+    @staticmethod
+    def _upstream_offer_keys():
+        """The keys ``NostrTransport.publish_offer`` puts in its content dict."""
+        import inspect
+        import re
+        source = inspect.getsource(NostrTransport.publish_offer)
+        body = source.split("offer = {", 1)[1].split("}", 1)[0]
+        return set(re.findall(r"'([a-z_]+)':", body))
+
+    def test_payload_keys_match_upstream(self):
+        self.assertEqual(set(build_offer_payload(self._sm())),
+                         self._upstream_offer_keys())
+
+    def test_payload_values(self):
+        payload = build_offer_payload(self._sm())
+        self.assertEqual(payload['percentage_fee'], 0.5)
+        self.assertIsInstance(payload['percentage_fee'], float)  # <=4.7.1 compat
+        self.assertEqual(payload['mining_fee'], 1000)
+        self.assertEqual(payload['min_amount'], 20000)
+        self.assertEqual(payload['max_forward_amount'], 150000)
+        self.assertEqual(payload['max_reverse_amount'], 120000)
+        self.assertEqual(payload['relays'], "wss://a,wss://b")
+        self.assertEqual(payload['pow_nonce'], hex(0x1234))
+
+    def test_tags_match_what_takers_filter_on(self):
+        tags = dict((t[0], t[1]) for t in build_offer_tags(now_ts=1_000_000))
+        self.assertEqual(tags['d'], nc.d_tag_for(NostrTransport.NOSTR_EVENT_VERSION))
+        self.assertEqual(tags['r'], nc.r_tag_for(constants.net.NET_NAME))
+        # upstream's NIP-40 window, unchanged: the expiry gap is fixed by
+        # re-announcing sooner, not by claiming a longer life for the event
+        self.assertEqual(
+            int(tags['expiration']),
+            1_000_000 + NostrTransport.OFFER_UPDATE_INTERVAL_SEC + 10)
+
+    def test_republish_interval_stays_inside_the_expiry(self):
+        # The whole point of owning the loop: upstream republishes at 600s
+        # against a 610s expiry, checked on a 30s tick and stamped after the
+        # publish, so the offer is expired on strict relays for part of each
+        # cycle. Ours must leave real headroom.
+        lifetime = NostrTransport.OFFER_UPDATE_INTERVAL_SEC + 10
+        self.assertLess(SwapServerGuiPlugin.REPUBLISH_INTERVAL_SEC, lifetime / 1.5)
+
 
 class TestNostrIdentity(unittest.TestCase):
 
@@ -225,6 +329,19 @@ class TestStatusSnapshot(unittest.TestCase):
         self.assertEqual(st["pow_bits_achieved"], 0)  # nonce 0 == no work
         # server not running -> STOPPED, regardless of the missing liquidity
         self.assertIs(st["announce_state"], AnnounceState.STOPPED)
+
+    def test_status_has_every_key_the_qt_tab_reads(self):
+        # The Qt tests are skipped wherever PyQt6 is absent (CI included), so
+        # nothing else catches a status() key the 4s refresh reads but status()
+        # stopped providing -- which surfaces as a KeyError every 4 seconds.
+        import re
+        qt_source = os.path.join(_PLUGINS_DIR, "swapserver_gui", "qt.py")
+        with open(qt_source, encoding="utf-8") as f:
+            wanted = set(re.findall(r'st\[["\']([a-z_]+)["\']\]', f.read()))
+        self.assertTrue(wanted, "found no st[...] lookups; the regex is stale")
+        keypair = mock.Mock(pubkey=PUBKEY_33)
+        plugin, _ = _make_plugin(_Config(relays="wss://a"), keypair=keypair)
+        self.assertEqual(wanted - set(plugin.status()), set())
 
     def test_no_liquidity_reason_names_the_threshold(self):
         keypair = mock.Mock(pubkey=PUBKEY_33)

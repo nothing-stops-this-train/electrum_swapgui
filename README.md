@@ -28,7 +28,9 @@ The server runs two independent transports (either or both):
 
 - **HTTP** — an aiohttp endpoint on `localhost:<port>` (`/getpairs`,
   `/createswap`, …), reusing Electrum's bundled `swapserver` request handlers.
-- **Nostr** — announces the offer to the configured `nostr_relays`.
+- **Nostr** — announces the offer to the configured `nostr_relays`, on the
+  plugin's own announce loop (see
+  [Keeping the announcement alive](#keeping-the-announcement-alive)).
 
 ## Why a separate plugin?
 
@@ -100,9 +102,42 @@ Ranked causes, most common first:
    it build an `HttpTransport`, and a wallet that is itself a server never runs
    the discovery loop.
 6. **Relay-side expiry.** Announcements carry a NIP-40 `expiration` of ~10
-   minutes and are republished every 10 minutes, so a server that has been down
-   for longer has no stored offer left. Some public relays also silently refuse
-   kind `30315`.
+   minutes, so a server that has been down for longer has no stored offer left.
+   Some public relays also silently refuse kind `30315`.
+7. **The announcement stopped going out.** The Status tab reports when a relay
+   last *acknowledged* an announcement, and warns when that is older than the
+   re-announce interval. See below for why upstream's loop could stop silently.
+
+## Keeping the announcement alive
+
+The offer expires after ~10 minutes, so a swap server is only as discoverable
+as its last re-announcement. The plugin therefore runs its own announce loop
+instead of calling `SwapManager.run_nostr_server`, which can stop announcing
+permanently without anything noticing:
+
+- it waits on `transport.is_connected` with **no timeout**. That event is set
+  once, only if `relay_manager.connect()` found a live relay on its single
+  attempt. If every relay is unreachable at that moment — Electrum starting
+  before the network is up, Tor not ready, a resume from suspend — the wait
+  never completes, for the rest of the process. `check_direct_messages` blocks
+  with it, so the server also stops answering swap requests over nostr.
+- `aionostr.Manager.connect` **permanently drops** relays that missed that one
+  attempt (`self.relays = connected`) and never runs again, so a blip can
+  silently reduce a five-relay server to one.
+- it republishes at 600 s against a 610 s expiry, on a 30 s tick, stamping the
+  interval *after* the publish returns — so the real period is 600–630 s plus
+  latency and drifts later each cycle, leaving the offer expired on strict
+  relays for part of every cycle.
+- `publish_offer` is `@ignore_exceptions` and swallows `TimeoutError`
+  internally, so a server no relay accepts looks exactly like a healthy one.
+
+The plugin's loop re-announces every 5 minutes (comfortably inside the expiry),
+rebuilds the transport with a bounded backoff whenever it cannot connect — which
+is also what restores pruned relays — recycles it hourly and after repeated
+unacknowledged publishes, and composes and sends the event itself so it knows
+whether a relay actually acknowledged it. `AnnounceState` gained
+`NO_RELAY_CONNECTED`, `PUBLISH_FAILING` and `TASK_DEAD`, each of which the tab
+previously rendered as "announcing to N relay(s)".
 
 **Check discoverability** asks each configured relay the taker's own question,
 using a throwaway key, and names the first rule that rejects you — per relay,
@@ -189,7 +224,13 @@ ELECTRUM_SRC=/path/to/electrum python3 -m unittest discover -s tests -v
   order of checks `_get_pairs_loop` performs, so the field we blame is the one
   that actually rejects us upstream.
 - `tests/test_diagnostics.py` — the announcement state machine, the liquidity
-  gate (`publish_offer`'s early return), and the npub shown in the Status tab.
+  gate (`publish_offer`'s early return), the npub shown in the Status tab, and
+  the offer payload/tags pinned against upstream's `publish_offer` so the event
+  we compose ourselves cannot drift out of what takers parse.
+- `tests/test_announce_e2e.py` — the announce loop against a **real** in-process
+  relay: a started server becomes discoverable to the taker's own filter, keeps
+  re-announcing before the offer expires, and recovers when a relay that was
+  unreachable at start-up comes back (the case upstream never recovers from).
 - `tests/test_discovery_e2e.py` — the check driven against a **real** NIP-01
   relay hosted in-process (`tests/fake_relay.py`, aiohttp WebSocket): offers are
   published with `electrum_aionostr` exactly as the server does, signatures are

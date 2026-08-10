@@ -41,6 +41,8 @@ for _p in (_ELECTRUM_SRC, _PLUGINS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from electrum.submarine_swaps import NostrTransport  # noqa: E402
+
 from swapserver_gui.swapserver_gui import SwapServerGuiPlugin  # noqa: E402
 from swapserver_gui import pow as swap_pow  # noqa: E402
 
@@ -78,10 +80,13 @@ class _SwapManager:
         self._max_reverse = None
         self.mining_fee = None
         self.pow_calls = 0
+        self.network = None
+        #: set once the announce loop gets past the proof-of-work and builds a
+        #: nostr transport (see _fake_transport_cls)
         self.nostr_started = threading.Event()
 
     async def run_nostr_server(self):
-        self.nostr_started.set()
+        # unreachable: the plugin runs its own announce loop
         await asyncio.Event().wait()
 
     async def set_nostr_proof_of_work(self):
@@ -89,6 +94,35 @@ class _SwapManager:
 
     def server_update_pairs(self):
         self.percentage = 0.5
+
+
+def _fake_transport_cls(sm):
+    """A NostrTransport stand-in that just records having been built.
+
+    These tests are about shutting down mid-proof-of-work, so the transport must
+    never connect anywhere -- but the announce loop reaching it is exactly the
+    signal ``nostr_started`` carries.
+    """
+    class _FakeTransport:
+        NOSTR_EVENT_VERSION = NostrTransport.NOSTR_EVENT_VERSION
+        USER_STATUS_NIP38 = NostrTransport.USER_STATUS_NIP38
+        OFFER_UPDATE_INTERVAL_SEC = NostrTransport.OFFER_UPDATE_INTERVAL_SEC
+
+        def __init__(self, config, sm_, keypair):
+            self.connect_timeout = 0.1
+            self.is_connected = asyncio.Event()
+            sm.nostr_started.set()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def stop(self):
+            pass
+
+    return _FakeTransport
 
 
 def _make_wallet(sm, *, pubkey=PUBKEY_33):
@@ -147,6 +181,10 @@ class WalletCloseDuringPowTests(unittest.TestCase):
     """The wallet must close cleanly while the proof-of-work is still running."""
 
     def _running_plugin(self, loop, config, sm):
+        patch = mock.patch("swapserver_gui.swapserver_gui.NostrTransport",
+                           _fake_transport_cls(sm))
+        patch.start()
+        self.addCleanup(patch.stop)
         plugin = SwapServerGuiPlugin(mock.MagicMock(), config, "swapserver_gui")
         plugin.bind_wallet(_make_wallet(sm))
         plugin.start_server()
