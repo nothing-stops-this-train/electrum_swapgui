@@ -94,6 +94,12 @@ def _make_wallet(db: WalletDB, config: _Config) -> Any:
     lnaddr.get_min_final_cltv_delta.return_value = 200
     wallet.lnworker.get_bolt11_invoice.return_value = (lnaddr, 'lnbc1fakeinvoice')
     wallet.lnworker.create_payment_info.return_value = b'\x0f' * 32
+    # "this payment hash is free": create_normal_swap rejects a hash that is
+    # already a known preimage or part of a payment bundle.  A MagicMock answers
+    # both with a truthy Mock, which reads as "already in use" and fails every
+    # swap -- so these have to be pinned rather than left to auto-speccing.
+    wallet.lnworker.get_preimage.return_value = None
+    wallet.lnworker.has_payment_bundle.return_value = False
     return wallet
 
 
