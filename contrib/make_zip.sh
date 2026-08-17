@@ -9,6 +9,7 @@
 #     swapserver_gui/manifest.json
 #     swapserver_gui/__init__.py
 #     swapserver_gui/swapserver_gui.py
+#     swapserver_gui/served_swaps.py
 #     swapserver_gui/pow.py
 #     swapserver_gui/nostr_check.py
 #     swapserver_gui/qt.py
@@ -52,6 +53,11 @@ rm -f "$OUT"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 cp -r "$PLUGIN_DIR" "$STAGE/swapserver_gui"
+# Ship only the package.  Anything else that has appeared in the working copy --
+# byte-code caches, a stray .pytest_cache from running the tests with the wrong
+# working directory, an editor's dot-directory -- has no business in a plugin an
+# end user authorises and installs.
+find "$STAGE/swapserver_gui" -mindepth 1 -maxdepth 1 -name '.*' -prune -exec rm -rf {} +
 rm -rf "$STAGE/swapserver_gui/__pycache__"
 
 if [ -n "$VERSION" ]; then
