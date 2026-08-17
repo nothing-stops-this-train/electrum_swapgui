@@ -10,21 +10,24 @@ import importlib
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import time
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QModelIndex
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QGroupBox,
     QLabel, QPushButton, QSpinBox, QPlainTextEdit, QTreeWidget, QTreeWidgetItem,
-    QSizePolicy, QTabWidget,
+    QSizePolicy, QTabWidget, QAbstractItemView, QDialog,
 )
+from PyQt6.QtCore import QItemSelectionModel
 
 from electrum.i18n import _
 from electrum.plugin import hook
-from electrum.gui.qt.util import read_QIcon, pubkey_to_q_icon, WWLabel, ColorScheme
+from electrum.gui.qt.util import (
+    read_QIcon, pubkey_to_q_icon, WWLabel, ColorScheme, Buttons, CloseButton,
+)
 
 from .swapserver_gui import (
-    SwapServerGuiPlugin, SwapServerError, AnnounceState, MIXED_ROW_MARKER,
-    format_mixed_note, format_summary_line, get_swap_history, get_swap_summary,
-    save_settings,
+    SwapServerGuiPlugin, SwapServerError, AnnounceState, ComponentKind,
+    ServedSwapRow, SwapComponent, build_served_swap_rows, format_batched_note,
+    format_summary_line, get_swap_summary, save_settings,
 )
 # NB: not ``from . import pow as swap_pow`` -- that form breaks when Electrum
 # loads this plugin from a zip.  See the long comment in swapserver_gui.py.
@@ -50,6 +53,254 @@ def _fmt_sat(config, sat: Optional[int]) -> str:
         return f"{sat} sat"
 
 
+# ---------------------------------------------------------------------------
+# Jumping to a swap component in Electrum's History tab
+#
+# ``history_list.py`` has no ``run_hook`` anywhere and no "select this entry"
+# entry point, so we drive its model directly.  ``HistoryModel`` is a
+# ``CustomModel`` tree (electrum/gui/qt/custom_model.py): one node per history
+# row, with the members of a group as child nodes.  A transaction can therefore
+# be either a top-level node or a child of the group it was folded into, and
+# which of the two is not knowable in advance -- ``wallet.get_full_history``
+# replaces a single-member group with the member itself.  So we look in both.
+# ---------------------------------------------------------------------------
+
+def _tab_index_for_widget(tabs: QTabWidget, widget: Optional[QWidget]) -> int:
+    """Index of the tab that (eventually) contains ``widget``, or -1.
+
+    ``ElectrumWindow.create_history_tab`` wraps the list in a container and does
+    not keep a reference to it, so the tab has to be found from the list up.
+    """
+    while widget is not None:
+        idx = tabs.indexOf(widget)
+        if idx != -1:
+            return idx
+        widget = widget.parentWidget()
+    return -1
+
+
+def _history_item_matches(
+        item: Any, *, txid: Optional[str], payment_hash: Optional[str]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if txid and item.get('txid') == txid:
+        return True
+    if payment_hash and item.get('payment_hash') == payment_hash:
+        return True
+    return False
+
+
+def find_history_index(
+        history_model: Any,
+        *,
+        txid: Optional[str] = None,
+        payment_hash: Optional[str] = None,
+) -> Optional[QModelIndex]:
+    """The source-model index of a history row, searching groups too."""
+    root = getattr(history_model, '_root', None)
+    if root is None:
+        return None
+    # ``CustomModel.index`` forwards its parent straight to ``rowCount``, which
+    # calls ``.isValid()`` on it -- so the root has to be an invalid
+    # QModelIndex, not the None its signature defaults to.
+    top = QModelIndex()
+    for row, node in enumerate(root._children):
+        if _history_item_matches(node.get_data(), txid=txid, payment_hash=payment_hash):
+            return history_model.index(row, 0, top)
+        for child_row, child in enumerate(node._children):
+            if _history_item_matches(child.get_data(), txid=txid, payment_hash=payment_hash):
+                return history_model.index(child_row, 0,
+                                           history_model.index(row, 0, top))
+    return None
+
+
+def show_in_history(
+        window: 'ElectrumWindow',
+        *,
+        txid: Optional[str] = None,
+        payment_hash: Optional[str] = None,
+) -> bool:
+    """Switch to the History tab and select a transaction there.
+
+    Returns False when the row could not be shown -- it is not in the history,
+    or the user has a date filter on that excludes it -- so the caller can say
+    so instead of silently doing nothing.
+    """
+    history_list = getattr(window, 'history_list', None)
+    history_model = getattr(window, 'history_model', None)
+    if history_list is None or history_model is None:
+        return False
+    idx = _tab_index_for_widget(window.tabs, history_list)
+    if idx != -1:
+        window.tabs.setCurrentIndex(idx)
+    # The model skips refreshes while its view is hidden (MyTreeView.
+    # maybe_defer_update), and the tab we just selected is not painted yet, so a
+    # swap that completed since the operator last looked at the History tab
+    # would not be in the model.  Force the refresh the same way upstream's
+    # showEvent does.
+    try:
+        history_list._forced_update = True
+        history_list.update()
+    except Exception:
+        pass
+    finally:
+        try:
+            history_list._forced_update = False
+        except Exception:
+            pass
+    source_index = find_history_index(history_model, txid=txid, payment_hash=payment_hash)
+    if source_index is None or not source_index.isValid():
+        return False
+    proxy = history_list.model()
+    # Only a row inside a group needs its parent expanded.  ``.parent()`` cannot
+    # answer that: ``CustomModel.parent`` returns ``createIndex(...)`` for the
+    # root node itself rather than an invalid index, so a *top-level* row also
+    # reports a valid parent.  Ask the node instead.
+    node = source_index.internalPointer()
+    parent_node = node.parent() if node is not None else None
+    if parent_node is not None and parent_node is not getattr(history_model, '_root', None):
+        history_list.expand(proxy.mapFromSource(source_index.parent()))
+    index = proxy.mapFromSource(source_index)
+    if not index.isValid():
+        return False
+    history_list.setCurrentIndex(index)
+    history_list.selectionModel().select(
+        index,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect
+        | QItemSelectionModel.SelectionFlag.Rows)
+    history_list.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
+    history_list.setFocus()
+    return True
+
+
+class SwapComponentsDialog(QDialog):
+    """What one served swap is actually made of, and where to find each part.
+
+    A swap is never a single transaction: it is a lightning payment (plus a
+    mining-fee prepayment, when we are the one funding on-chain), a funding
+    transaction and a claim transaction, and only some of those belong to this
+    wallet.  The Swap Server tab shows the swap as one row; this is where the
+    row comes apart again.
+
+    Deliberately *not* a ``WindowModalDialog``, which is what the rest of the
+    Qt GUI uses: this window's whole purpose is to send the user to the History
+    tab, and a window-modal dialog blocks the very window they are being sent
+    to.  Non-modal also lets them walk through the components one by one.
+    """
+
+    #: Column indexes of the component tree.
+    COL_COMPONENT, COL_AMOUNT, COL_LOCATION = range(3)
+
+    def __init__(self, tab: 'SwapServerTab', row: 'ServedSwapRow') -> None:
+        QDialog.__init__(self, tab)
+        self.setWindowTitle(_("Swap details"))
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.tab = tab
+        self.row = row
+        self.window = tab.window
+        self.config = tab.config
+        self.setMinimumSize(720, 380)
+
+        outer = QVBoxLayout(self)
+        outer.addWidget(self._build_summary())
+
+        hint = QLabel(_("Double-click a component to show it in the History tab."))
+        hint.setEnabled(False)  # renders dimmed, like secondary text
+        outer.addWidget(hint)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels([_("Component"), _("Amount"), _("Location")])
+        self.tree.setRootIsDecorated(False)
+        self.tree.itemDoubleClicked.connect(self.on_component_activated)
+        outer.addWidget(self.tree, 1)
+        self._fill_tree()
+
+        self.status_label = WWLabel("")
+        self.status_label.setVisible(False)
+        outer.addWidget(self.status_label)
+        outer.addLayout(Buttons(CloseButton(self)))
+
+    # ------------------------------------------------------------------ build
+    def _build_summary(self) -> QGroupBox:
+        row = self.row
+        box = QGroupBox(row.label)
+        form = QFormLayout(box)
+        kind = _("forward swap (the taker sent on-chain, we paid lightning)") \
+            if row.taker_is_forward \
+            else _("reverse swap (the taker paid lightning, we sent on-chain)")
+        form.addRow(_("Type:"), self._value_label(kind))
+        form.addRow(_("Date:"), self._value_label(row.date))
+        form.addRow(_("Net return:"), self._value_label(_fmt_sat(self.config, row.return_sat)))
+        form.addRow(_("On-chain amount:"),
+                    self._value_label(_fmt_sat(self.config, row.onchain_amount_sat)))
+        form.addRow(_("Lightning amount:"),
+                    self._value_label(_fmt_sat(self.config, row.lightning_amount_sat)))
+        form.addRow(_("Payment hash:"), self._value_label(row.payment_hash))
+        form.addRow(_("Lockup address:"), self._value_label(row.lockup_address))
+        form.addRow(_("Refund locktime:"), self._value_label(
+            _("block {}").format(row.locktime) if row.locktime else "—"))
+        if row.batched_with:
+            note = WWLabel(format_batched_note(batched_with=row.batched_with))
+            form.addRow(note)
+        return box
+
+    @staticmethod
+    def _value_label(text: str) -> QLabel:
+        label = QLabel(text or "—")
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        return label
+
+    def _fill_tree(self) -> None:
+        self.tree.clear()
+        for component in self.row.components:
+            amount = "—" if component.value_sat is None \
+                else _fmt_sat(self.config, component.value_sat)
+            if component.in_wallet:
+                location = _("in this wallet's history")
+            elif component.txid:
+                location = _("made by the taker")
+            else:
+                location = _("not recorded")
+            item = QTreeWidgetItem([component.title, amount, location])
+            item.setData(self.COL_COMPONENT, Qt.ItemDataRole.UserRole, component)
+            identifier = component.txid or component.payment_hash or ""
+            tip = component.detail
+            if identifier:
+                tip += "\n\n" + identifier
+            for col in range(3):
+                item.setToolTip(col, tip)
+            if not component.in_wallet:
+                # Nothing to jump to; say so by dimming the row rather than by
+                # letting a double-click silently do nothing.
+                item.setForeground(self.COL_LOCATION, ColorScheme.GRAY.as_color())
+            self.tree.addTopLevelItem(item)
+        for col in range(3):
+            self.tree.resizeColumnToContents(col)
+
+    # ----------------------------------------------------------- interaction
+    def on_component_activated(self, item: QTreeWidgetItem, column: int) -> None:
+        component = item.data(self.COL_COMPONENT, Qt.ItemDataRole.UserRole)
+        if component is None:
+            return
+        if not component.in_wallet:
+            self._say(_("{name} was made by the taker, so it is not in this "
+                        "wallet's history.").format(name=component.title))
+            return
+        found = show_in_history(self.window, txid=component.txid,
+                                payment_hash=component.payment_hash)
+        if found:
+            self._say("")
+        else:
+            self._say(_("Could not find {name} in the History tab. A date "
+                        "filter may be hiding it.").format(name=component.title))
+
+    def _say(self, message: str) -> None:
+        self.status_label.setText(message)
+        self.status_label.setVisible(bool(message))
+
+
 class SwapServerTab(QWidget):
     """The 'Swap Server' tab: enable/disable, settings, and live output."""
 
@@ -67,6 +318,9 @@ class SwapServerTab(QWidget):
         self._pubkey_hex: Optional[str] = None
         self._check_running: bool = False
         self._alive: List[bool] = [True]  # cleared by clean_up(); see on_check_discoverability
+        # Open (non-modal) swap-detail windows. Nothing else refers to them, so
+        # without this they would be collected as soon as they were shown.
+        self._detail_dialogs: List['SwapComponentsDialog'] = []
         self.checkFinished.connect(self.on_check_finished)
 
         root = QVBoxLayout(self)
@@ -259,6 +513,11 @@ class SwapServerTab(QWidget):
         self.history_tree = QTreeWidget()
         self.history_tree.setHeaderLabels([_("Date"), _("Label"), _("Return (sat)")])
         self.history_tree.setRootIsDecorated(False)
+        self.history_tree.setToolTip(_(
+            "One row per swap served, even when several swaps were settled by "
+            "the same transaction.\nDouble-click a row to see the components "
+            "that swap is made of."))
+        self.history_tree.itemDoubleClicked.connect(self.on_history_row_activated)
         outer.addWidget(self.history_tree, 1)
 
         return page
@@ -525,6 +784,11 @@ class SwapServerTab(QWidget):
         self._alive[0] = False
         self.plugin.cancel_discovery_check()
         self._check_running = False
+        # Detail windows outlive the tab as top-level widgets, and they hold a
+        # wallet the caller is in the middle of closing. Take them with us.
+        for dialog in list(self._detail_dialogs):
+            dialog.close()
+        self._detail_dialogs.clear()
         if self._timer is not None:
             self._timer.stop()
             try:
@@ -710,32 +974,47 @@ class SwapServerTab(QWidget):
 
     def _refresh_history(self) -> None:
         try:
-            history = get_swap_history(self.wallet)
+            rows = build_served_swap_rows(self.wallet)
         except Exception:
             self.plugin.logger.debug("failed to compute swap history", exc_info=True)
             return
-        summary = get_swap_summary(history)
+        summary = get_swap_summary(rows)
         self.summary_label.setText(format_summary_line(
             num_swaps=summary["num_swaps"],
             net_return=_fmt_sat(self.config, summary["overall_return_sat"]),
             swaps_per_day=summary["swaps_per_day"],
-            num_mixed=summary["num_mixed"],
+            num_batched=summary["num_batched"],
         ))
         self.history_tree.clear()
-        for item in reversed(history):  # newest first
-            label = item["label"]
-            if item.get("is_mixed"):
-                label += "  " + MIXED_ROW_MARKER
-            tree_item = QTreeWidgetItem([item["date"], label, str(item["return_sat"])])
-            if item.get("is_mixed"):
-                # The return value covers every swap in the batch, so it is not
-                # purely server revenue. Say so rather than silently counting it
-                # (or silently dropping the row and under-reporting).
-                tip = format_mixed_note(num_served=item["num_served_swaps"],
-                                        num_own=item["num_own_swaps"])
-                tree_item.setToolTip(1, tip)
-                tree_item.setToolTip(2, tip)
+        for row in reversed(rows):  # newest first
+            tree_item = QTreeWidgetItem([row.date, row.label, str(row.return_sat)])
+            tree_item.setData(0, Qt.ItemDataRole.UserRole, row)
+            tip = _("{n} component(s); double-click for details.").format(
+                n=len(row.components))
+            if row.batched_with:
+                # Unlike before, the value *is* this swap's own -- the shared
+                # transaction's fee is split across the swaps that caused it --
+                # but the operator still needs to know why one wallet
+                # transaction shows up behind several rows here.
+                tip += "\n\n" + format_batched_note(batched_with=row.batched_with)
+            for col in range(3):
+                tree_item.setToolTip(col, tip)
             self.history_tree.addTopLevelItem(tree_item)
+
+    def on_history_row_activated(self, item: QTreeWidgetItem, column: int) -> None:
+        row = item.data(0, Qt.ItemDataRole.UserRole)
+        if row is None:
+            return
+        dialog = SwapComponentsDialog(self, row)
+        # Non-modal, so nothing else holds a reference and Python would collect
+        # the window the moment this returns. Drop ours when it closes.
+        self._detail_dialogs.append(dialog)
+        dialog.finished.connect(
+            lambda _result, d=dialog: self._detail_dialogs.remove(d)
+            if d in self._detail_dialogs else None)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
 
 class Plugin(SwapServerGuiPlugin):
@@ -784,15 +1063,20 @@ class Plugin(SwapServerGuiPlugin):
     def close_wallet(self, wallet: 'Abstract_Wallet') -> None:
         self.stop_server()
         self._remove_tab()
+        # Also puts back the swap manager's own history-group builder, which we
+        # wrap for as long as a wallet is bound (see _install_history_relabeller).
+        self.unbind_wallet()
 
     @hook
     def on_close_window(self, window: 'ElectrumWindow') -> None:
         if window is self._window:
             self.stop_server()
             self._remove_tab()
+            self.unbind_wallet()
 
     def close(self) -> None:
         # called when the plugin is disabled from the Plugins dialog
         self.stop_server()
         self._remove_tab()
+        self.unbind_wallet()
         super().close()

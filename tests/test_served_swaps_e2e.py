@@ -44,8 +44,8 @@ from electrum.submarine_swaps import SwapManager  # noqa: E402
 from electrum.wallet_db import WalletDB  # noqa: E402
 
 from swapserver_gui.swapserver_gui import (  # noqa: E402
-    SERVED_SWAPS_DB_KEY, SwapServerGuiPlugin, get_swap_history, get_swap_summary,
-    served_swaps_ledger,
+    ComponentKind, SERVED_SWAPS_DB_KEY, SwapServerGuiPlugin,
+    build_served_swap_rows, get_swap_summary, served_swaps_ledger,
 )
 
 THEIR_PUBKEY = bytes.fromhex('02' + '11' * 32)  # the taker's key, we only embed it
@@ -66,6 +66,9 @@ class _Config:
         self.SWAPSERVER_FEE_MILLIONTHS = 5000
         self.SWAPSERVER_POW_TARGET = 0
         self.SWAPSERVER_GUI_AUTOSTART = False
+
+    def format_amount_and_units(self, sat: int) -> str:
+        return f"{int(sat)} sat"
 
 
 class _Value:
@@ -118,13 +121,35 @@ def _make_swap_manager(wallet: Any) -> SwapManager:
     return sm
 
 
-def _group(label: str, value: int, ts: int) -> Dict[str, Any]:
+def _onchain(txid: str, value: int, *, fee: int, ts: int) -> Dict[str, Any]:
+    """A wallet history entry for an on-chain transaction."""
     return {
-        'label': label,
+        'txid': txid,
+        'lightning': False,
         'value': _Value(value),
-        'date': datetime.datetime.fromtimestamp(ts),
+        'bc_value': _Value(value),
+        'ln_value': _Value(0),
+        'fee_sat': fee,
         'timestamp': ts,
+        'date': datetime.datetime.fromtimestamp(ts),
     }
+
+
+def _ln(payment_hash: str, value: int, *, ts: int) -> Dict[str, Any]:
+    """A wallet history entry for a lightning payment."""
+    return {
+        'payment_hash': payment_hash,
+        'lightning': True,
+        'value': _Value(value),
+        'ln_value': _Value(value),
+        'bc_value': _Value(0),
+        'timestamp': ts,
+        'date': datetime.datetime.fromtimestamp(ts),
+    }
+
+
+def _history(*entries: Dict[str, Any]) -> Dict[str, Any]:
+    return {(e.get('txid') or e.get('payment_hash')): e for e in entries}
 
 
 class ServedSwapsE2ETest(unittest.TestCase):
@@ -270,28 +295,103 @@ class ServedSwapsE2ETest(unittest.TestCase):
         self.assertIsNotNone(self.sm._swaps[own_reverse].prepay_hash)
 
         # Confirm them. The served forward swap and our own reverse swap are
-        # claimed by one batched tx, which is what makes a group "mixed".
+        # claimed by one batched transaction, which is exactly what
+        # ``_claim_swap`` does: every claim goes into the one 'swaps' batch.
         self._confirm(served_reverse, funding='tx_served_funding', spending='tx_served_claim')
-        self._confirm(served_forward, funding='tx_f', spending='tx_batched_claim')
-        self._confirm(own_reverse, funding='tx_r', spending='tx_batched_claim')
+        self._confirm(served_forward, funding='tx_f', spending='tx_batch')
+        self._confirm(own_reverse, funding='tx_r', spending='tx_batch')
         self._confirm(own_forward, funding='tx_own_funding', spending='tx_own_claim')
-        self.wallet.get_full_history.return_value = {
-            'group:tx_served_funding': _group('Forward swap 0.2 mBTC', 205, 1_700_000_000),
-            'group:tx_batched_claim': _group('Reverse swap 0.3 mBTC', 64, 1_700_000_100),
-            'group:tx_own_funding': _group('Forward swap 0.1 mBTC', -900, 1_700_000_200),
-        }
 
-        history = get_swap_history(self.wallet)
-        self.assertEqual([h['label'] for h in history],
-                         ['Forward swap 0.2 mBTC', 'Reverse swap 0.3 mBTC'])
-        self.assertEqual([h['is_mixed'] for h in history], [False, True])
-        self.assertEqual(history[1]['num_served_swaps'], 1)
-        self.assertEqual(history[1]['num_own_swaps'], 1)
+        sr = self.sm._swaps[served_reverse]   # we funded on-chain
+        sf = self.sm._swaps[served_forward]   # we claim on-chain
+        orv = self.sm._swaps[own_reverse]     # ours, claimed by the same batch
+        batch_delta = sf.onchain_amount + orv.onchain_amount - 500
+        self.wallet.get_full_history.return_value = _history(
+            _onchain('tx_served_funding', -sr.onchain_amount - 300, fee=300,
+                     ts=1_700_000_000),
+            _ln(served_reverse, sr.lightning_amount - 2_000, ts=1_700_000_000),
+            _ln(sr.prepay_hash.hex(), 2_000, ts=1_700_000_000),
+            _onchain('tx_batch', batch_delta, fee=500, ts=1_700_000_100),
+            _ln(served_forward, -sf.lightning_amount, ts=1_700_000_100),
+            _onchain('tx_own_funding', -900, fee=100, ts=1_700_000_200),
+        )
 
-        summary = get_swap_summary(history)
-        self.assertEqual(summary['num_swaps'], 2)          # not 3
-        self.assertEqual(summary['overall_return_sat'], 269)  # our -900 is not here
-        self.assertEqual(summary['num_mixed'], 1)
+        rows = build_served_swap_rows(self.wallet)
+        self.assertEqual(len(rows), 2)                       # not 3, and not 4
+        self.assertIn("Served reverse swap", rows[0].label)  # a taker's reverse swap
+        self.assertIn("Served forward swap", rows[1].label)  # ...and forward swap
+
+        # The funding swap is alone in its transaction, so it carries the whole
+        # 300 sat fee: it is a complete, exact reconciliation.
+        self.assertEqual(rows[0].batched_with, 0)
+        self.assertEqual(rows[0].return_sat,
+                         sr.lightning_amount - sr.onchain_amount - 300)
+
+        # The claimed one shared its transaction with a swap of ours, so it pays
+        # part of that transaction's fee -- some, but not all of it.
+        self.assertEqual(rows[1].batched_with, 1)
+        claim = [c for c in rows[1].components if c.kind is ComponentKind.CLAIM_TX][0]
+        self.assertTrue(claim.in_wallet)
+        self.assertLess(claim.value_sat, sf.onchain_amount)
+        self.assertGreater(claim.value_sat, sf.onchain_amount - 500)
+        self.assertEqual(rows[1].return_sat, claim.value_sat - sf.lightning_amount)
+
+        # The taker's own leg is listed but is not ours to account for.
+        funding = [c for c in rows[1].components if c.kind is ComponentKind.FUNDING_TX][0]
+        self.assertFalse(funding.in_wallet)
+        self.assertIsNone(funding.value_sat)
+
+        summary = get_swap_summary(rows)
+        self.assertEqual(summary['num_swaps'], 2)
+        self.assertEqual(summary['overall_return_sat'],
+                         rows[0].return_sat + rows[1].return_sat)
+        self.assertEqual(summary['num_batched'], 1)
+
+    def test_a_served_swap_is_one_row_not_one_per_leg(self) -> None:
+        """The bug this replaces: a swap showing up as several entries."""
+        self._start_server()
+        served = self._serve_taker_reverse_swap()
+        self._confirm(served, funding='tx_fund', spending='tx_taker_claim')
+        swap = self.sm._swaps[served]
+        self.wallet.get_full_history.return_value = _history(
+            _onchain('tx_fund', -swap.onchain_amount - 300, fee=300, ts=1_700_000_000),
+            _ln(served, swap.lightning_amount - 2_000, ts=1_700_000_000),
+            _ln(swap.prepay_hash.hex(), 2_000, ts=1_700_000_000),
+        )
+        rows = build_served_swap_rows(self.wallet)
+        self.assertEqual(len(rows), 1)
+        # ...and the one row carries every leg, including the taker's.
+        self.assertEqual([c.kind for c in rows[0].components],
+                         [ComponentKind.LN_PAYMENT, ComponentKind.LN_PREPAYMENT,
+                          ComponentKind.FUNDING_TX, ComponentKind.CLAIM_TX])
+        self.assertEqual([c.in_wallet for c in rows[0].components],
+                         [True, True, True, False])
+
+    def test_history_groups_are_relabelled_by_role(self) -> None:
+        """The real SwapManager's group builder, through our wrapper."""
+        self._start_server()
+        served_forward = self._serve_taker_forward_swap()
+        own_forward = self._own_forward_swap()
+        self._confirm(served_forward, funding='tx_f', spending='tx_claim')
+        self._confirm(own_forward, funding='tx_own_funding', spending='tx_own_claim')
+        # upstream reads the spending tx back to look for a preimage; there is
+        # no chain here, so tell it there is no such transaction.
+        self.wallet.lnworker.lnwatcher.adb.get_transaction.return_value = None
+
+        groups = self.sm.get_groups_for_onchain_history()
+        labels = {txid: entry['group_label'] for txid, entry in groups.items()}
+        # Upstream names swaps after *our* copy's is_reverse flag, so it calls a
+        # served forward swap a "Reverse swap". Say whose swap it was instead.
+        self.assertIn('Served forward swap', labels['tx_claim'])
+        self.assertIn('My forward swap', labels['tx_own_funding'])
+        # the per-leg labels are the component names and stay as upstream set them
+        self.assertEqual(groups['tx_claim']['label'], 'Claim transaction')
+
+        # ...and closing the wallet puts upstream's own method back.
+        self.plugin.unbind_wallet()
+        self.assertNotIn('get_groups_for_onchain_history', self.sm.__dict__)
+        groups = self.sm.get_groups_for_onchain_history()
+        self.assertIn('Reverse swap', groups['tx_claim']['group_label'])
 
     def test_classification_survives_a_wallet_file_round_trip(self) -> None:
         self._start_server()
@@ -305,17 +405,21 @@ class ServedSwapsE2ETest(unittest.TestCase):
         reloaded_db = WalletDB(self.db.dump(), storage=None, upgrade=True)
         self.assertEqual(set(reloaded_db.get(SERVED_SWAPS_DB_KEY)), {served})
         reloaded_wallet = _make_wallet(reloaded_db, self.config)
-        _make_swap_manager(reloaded_wallet)
-        self.assertEqual(set(reloaded_wallet.lnworker.swap_manager._swaps),
-                         {served, own})
-        reloaded_wallet.get_full_history.return_value = {
-            'group:tx_served_funding': _group('Forward swap 0.2 mBTC', 205, 1_700_000_000),
-            'group:tx_own_funding': _group('Forward swap 0.1 mBTC', -900, 1_700_000_200),
-        }
+        reloaded_sm = _make_swap_manager(reloaded_wallet)
+        self.assertEqual(set(reloaded_sm._swaps), {served, own})
+        swap = reloaded_sm._swaps[served]
+        reloaded_wallet.get_full_history.return_value = _history(
+            _onchain('tx_served_funding', -swap.onchain_amount - 300, fee=300,
+                     ts=1_700_000_000),
+            _ln(served, swap.lightning_amount, ts=1_700_000_000),
+            _onchain('tx_own_funding', -900, fee=100, ts=1_700_000_200),
+        )
 
-        history = get_swap_history(reloaded_wallet)
-        self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]['return_sat'], 205)
+        rows = build_served_swap_rows(reloaded_wallet)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].payment_hash, served)
+        self.assertEqual(rows[0].return_sat,
+                         swap.lightning_amount - swap.onchain_amount - 300)
 
     def test_recorder_is_removed_when_the_server_stops(self) -> None:
         self._start_server()
@@ -336,10 +440,11 @@ class ServedSwapsE2ETest(unittest.TestCase):
         })
         self.assertEqual(set(served_swaps_ledger(self.wallet)), before)
         self._confirm(response['id'], funding='tx_late', spending='tx_late_claim')
-        self.wallet.get_full_history.return_value = {
-            'group:tx_late': _group('Forward swap', 12, 1_700_000_300),
-        }
-        self.assertEqual(len(get_swap_history(self.wallet)), 1)
+        swap = self.sm._swaps[response['id']]
+        self.wallet.get_full_history.return_value = _history(
+            _onchain('tx_late', -swap.onchain_amount - 100, fee=100, ts=1_700_000_300),
+        )
+        self.assertEqual(len(build_served_swap_rows(self.wallet)), 1)
 
 
 if __name__ == "__main__":

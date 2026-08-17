@@ -18,7 +18,9 @@ From the tab you can:
     copyable, with the identicon takers see), the advertised pairs (min /
     max-forward / max-reverse / mining fee / fee %), your lightning
     send/receive liquidity, and the history & running P/L of swaps this node
-    has served — swaps you initiate yourself as a customer are **not** counted
+    has served — one row per swap, **double-click a row** to see the components
+    that swap is made of and click through to any of them in Electrum's History
+    tab. Swaps you initiate yourself as a customer are **not** counted
     (see [which swaps are counted](#a-note-on-which-swaps-are-counted)).
   - **Diagnostics** — why the offer is or is not going out, the three values a
     taker's filter must match, and a one-click **discoverability check**. See
@@ -153,7 +155,8 @@ plugins/swapserver_gui/
   manifest.json        # available_for: ["qt"], min_electrum_version
   __init__.py          # registers plugins.swapserver_gui.autostart
   _version.py          # plugin version, stamped from the git tag at build time
-  swapserver_gui.py    # GUI-agnostic server lifecycle + history helpers
+  swapserver_gui.py    # GUI-agnostic server lifecycle
+  served_swaps.py      # served-vs-own classifier, per-swap rows, history labels
   pow.py               # cancel-safe, resumable announcement proof-of-work
   nostr_check.py       # nostr identity + the discoverability rule engine/check
   qt.py                # the "Swap Server" tab + Plugin(load_wallet/close_wallet)
@@ -237,14 +240,18 @@ ELECTRUM_SRC=/path/to/electrum python3 -m unittest discover -s tests -v
   verified on receipt, and each failure mode (low PoW, wrong net, wrong version,
   crowded out, unreachable) is asserted to be named correctly.
 - `tests/test_served_swaps.py` — the served-vs-own classifier, the recorded
-  ledger, the history filter and the flagging of batched groups.
+  ledger, one-row-per-swap assembly, the batch mining-fee split (including that
+  the shares always add back up), and the history labels.
 - `tests/test_served_swaps_e2e.py` — a taker requests swaps over the **real**
   HTTP endpoint against Electrum's **real** `SwapManager` on a **real**
-  `WalletDB`; asserts only those reach the history, and that the classification
-  survives dumping and reloading the wallet file.
+  `WalletDB`; asserts only those reach the history, that a swap is one row with
+  all of its legs, that a batched claim is split per swap, that the real group
+  builder comes back relabelled by role, and that the classification survives
+  dumping and reloading the wallet file.
 - `tests/test_qt_tab.py` — builds the real `SwapServerTab` on Qt's offscreen
-  platform and drives `refresh()`. **Skips when PyQt6 is not installed**; CI
-  installs it so these run there.
+  platform and drives `refresh()`, opens the component window, and drives the
+  jump into a real `CustomModel` history tree. **Skips when PyQt6 is not
+  installed**; CI installs it so these run there.
 
 ### A note on which swaps are counted
 
@@ -270,12 +277,55 @@ Two mechanisms replace that guess, in order of authority:
    reverse pair mirrors it. The e2e test asserts this table against the objects
    upstream actually builds, so it cannot drift silently.
 
-One case survives both: `_claim_swap` feeds the claim input of *every*
-`is_reverse` swap into the single `'swaps'` tx batch regardless of role, so one
-batched transaction can settle a served swap together with one of your own.
-Wallet history aggregates value per group, so there is no per-swap split to
-report. Such rows are counted (dropping them would hide real revenue) and marked
-`⚠ batched`, with a tooltip saying the value covers both.
+### A note on one row per swap
+
+A swap is never one transaction. It is a lightning payment, sometimes a
+mining-fee prepayment, a funding transaction and a claim transaction — and only
+some of those are yours, depending on which side of the swap you were on. Rows
+are therefore keyed on the swap's **payment hash**, not on the wallet's history
+groups, because a group does two things that break the mapping: it collapses
+into its single member (`wallet.get_full_history` replaces a one-member group
+with the member itself, so the row ends up named after a leg — "Claim
+transaction" — instead of after the swap), and it merges swaps that happened to
+share a transaction.
+
+Sharing is normal, not an edge case: `_claim_swap` feeds every claim into the
+single `'swaps'` tx batch and `hold_invoice_callback` feeds every funding output
+into the same one, and `TxBatch._create_batch_tx` folds everything pending into
+one transaction. So one transaction can settle several served swaps *and*
+several of your own. Each swap still gets its own row and its own value: its
+legs, minus its share of that transaction's mining fee, apportioned by the
+vbytes each leg contributes (a claim input carries a witness — signature,
+preimage, redeem script — a funding output is 43 bytes). The shares are computed
+by largest remainder so they sum back to the fee **exactly**, which is what
+makes the rows reconcile against the wallet's own delta for the transaction.
+
+### A note on the History tab
+
+`history_list.py` has no `run_hook` anywhere, so a plugin cannot add a column or
+an icon to Electrum's History tab. What it *can* do is name the rows, which is
+also the part that was actively misleading: upstream labels a swap after
+`SwapData.is_reverse`, and that flag is stored from the point of view of
+whoever stored it. `server_create_normal_swap` — the handler for a taker's
+**forward** swap — calls `create_reverse_swap`, so a forward swap you served
+reads "Reverse swap" in your own history.
+
+The plugin wraps `SwapManager.get_groups_for_onchain_history` on the instance
+and rewrites the group labels to say the role out loud:
+
+| | |
+|---|---|
+| `⇄ Served forward swap 0.2 mBTC` | provided by your server to someone else |
+| `↪ My forward swap 0.1 mBTC` | initiated by you as a customer |
+
+Wrapping is necessary rather than tidy: that method both builds the mapping and
+re-applies the labels it carries on every history refresh, so a label written
+once would be overwritten within seconds. The per-leg labels ("Funding
+transaction", "Claim transaction") are left alone — they are the component
+names, and the component window uses the same ones. The leading word is what
+the History tab's search box filters on, and it survives CSV export. The wrapper
+is installed for as long as a wallet is bound, not just while the server runs,
+and is removed when the wallet closes or the plugin is disabled.
 
 ### A note on the HTTP port
 

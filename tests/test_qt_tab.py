@@ -36,12 +36,16 @@ for _p in (_ELECTRUM_SRC, _PLUGINS_DIR):
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtWidgets import QApplication, QTabWidget
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QApplication, QLabel, QTabWidget
     HAVE_QT = True
 except ImportError:
     HAVE_QT = False
 
-from swapserver_gui.swapserver_gui import AnnounceState, SwapServerGuiPlugin  # noqa: E402
+from swapserver_gui.swapserver_gui import (  # noqa: E402
+    AnnounceState, ComponentKind, ServedSwapRow, SwapComponent,
+    SwapServerGuiPlugin,
+)
 from swapserver_gui import nostr_check as nc  # noqa: E402
 from swapserver_gui.nostr_check import CheckStatus  # noqa: E402
 
@@ -79,8 +83,41 @@ class _SwapManager:
         pass
 
 
-@unittest.skipUnless(HAVE_QT, "PyQt6 not installed")
-class QtTabTests(unittest.TestCase):
+def _component(kind, title, *, txid=None, payment_hash=None, value_sat=None,
+               in_wallet=True):
+    return SwapComponent(kind=kind, title=title, txid=txid,
+                         payment_hash=payment_hash, value_sat=value_sat,
+                         in_wallet=in_wallet, detail="why this leg exists")
+
+
+def _row(*, label='⇄ Served forward swap 0.2 mBTC', return_sat=205,
+         payment_hash='aa' * 32, batched_with=0):
+    """A served forward swap: the taker funded, we claimed and paid lightning."""
+    return ServedSwapRow(
+        payment_hash=payment_hash,
+        label=label,
+        date='2025-09-04',
+        timestamp=1756982141,
+        return_sat=return_sat,
+        taker_is_forward=True,
+        components=[
+            _component(ComponentKind.LN_PAYMENT, "Lightning payment",
+                       payment_hash=payment_hash, value_sat=-99_000),
+            _component(ComponentKind.FUNDING_TX, "Funding transaction",
+                       txid='tx_theirs', in_wallet=False),
+            _component(ComponentKind.CLAIM_TX, "Claim transaction",
+                       txid='tx_claim', value_sat=99_800),
+        ],
+        lockup_address='bc1qlockup',
+        locktime=800_000,
+        onchain_amount_sat=100_000,
+        lightning_amount_sat=99_000,
+        batched_with=batched_with,
+    )
+
+
+class _TabHarness:
+    """Builds a real SwapServerTab against the offscreen QPA platform."""
 
     @classmethod
     def setUpClass(cls):
@@ -110,6 +147,10 @@ class QtTabTests(unittest.TestCase):
         tab = qt_mod.SwapServerTab(plugin, window)
         self.addCleanup(tab.clean_up)
         return tab, plugin, sm, window
+
+
+@unittest.skipUnless(HAVE_QT, "PyQt6 not installed")
+class QtTabTests(_TabHarness, unittest.TestCase):
 
     # ------------------------------------------------------------ structure
     def test_output_pane_has_status_and_diagnostics_subtabs(self):
@@ -415,48 +456,224 @@ class QtTabTests(unittest.TestCase):
         self.assertTrue(tab.check_btn.isEnabled())  # not left stuck on "Checking…"
 
     # --------------------------------------------------------------- history
-    # The filtering itself lives in test_served_swaps.py; these cover what the
-    # operator actually reads off the Status tab.
+    # Which swaps are counted, and what each row's value means, is pinned down
+    # in test_served_swaps.py; these cover what the operator actually reads off
+    # the Status tab and what a double-click does.
     def _history_rows(self, tab):
         tree = tab.history_tree
         return [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
 
-    def test_history_counts_only_served_swaps(self):
+    def test_history_shows_one_row_per_swap(self):
         tab, _, _, _ = self._make_tab()
-        history = [{'label': 'Forward swap', 'return_sat': 205, 'date': '2025-09-04',
-                    'timestamp': 1756982141, 'num_served_swaps': 1,
-                    'num_own_swaps': 0, 'is_mixed': False}]
-        with mock.patch("swapserver_gui.qt.get_swap_history", return_value=history):
+        rows = [_row(label='⇄ Served forward swap 0.2 mBTC', return_sat=205)]
+        with mock.patch("swapserver_gui.qt.build_served_swap_rows", return_value=rows):
             tab.refresh()
         self.assertIn("Swaps served: 1", tab.summary_label.text())
-        self.assertNotIn("batched", tab.summary_label.text())
-        rows = self._history_rows(tab)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].text(1), 'Forward swap')
-        self.assertEqual(rows[0].toolTip(1), "")
+        self.assertNotIn("shared transaction", tab.summary_label.text())
+        items = self._history_rows(tab)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].text(1), '⇄ Served forward swap 0.2 mBTC')
+        self.assertEqual(items[0].text(2), '205')
+        self.assertIn("component", items[0].toolTip(1))
 
-    def test_batched_row_is_flagged_not_hidden(self):
-        """A group covering a served swap AND one of ours still counts, but its
-        value is not purely server revenue, so the row has to say so."""
+    def test_two_swaps_sharing_a_transaction_are_two_rows(self):
+        """The whole point of the rewrite: a batch tx is not one row."""
         tab, _, _, _ = self._make_tab()
-        history = [{'label': 'Reverse swap', 'return_sat': 64, 'date': '2025-09-04',
-                    'timestamp': 1756983236, 'num_served_swaps': 1,
-                    'num_own_swaps': 1, 'is_mixed': True}]
-        with mock.patch("swapserver_gui.qt.get_swap_history", return_value=history):
+        rows = [_row(payment_hash='aa' * 32, return_sat=900, batched_with=1),
+                _row(payment_hash='bb' * 32, return_sat=400, batched_with=1)]
+        with mock.patch("swapserver_gui.qt.build_served_swap_rows", return_value=rows):
             tab.refresh()
-        self.assertIn("1 batched with own swaps", tab.summary_label.text())
-        rows = self._history_rows(tab)
-        self.assertEqual(len(rows), 1)                 # reported, not dropped
-        self.assertIn("batched", rows[0].text(1))
-        self.assertEqual(rows[0].text(2), "64")        # value still shown in full
-        self.assertIn("not purely", rows[0].toolTip(1))
-        self.assertIn("not purely", rows[0].toolTip(2))
+        items = self._history_rows(tab)
+        self.assertEqual(len(items), 2)
+        self.assertIn("2 settled in a shared transaction", tab.summary_label.text())
+        # the value shown is the swap's own share, so the note explains the
+        # shared transaction rather than disclaiming the number
+        self.assertIn("this swap's own share", items[0].toolTip(2))
 
     def test_history_survives_a_failing_swap_manager(self):
         tab, _, _, _ = self._make_tab()
-        with mock.patch("swapserver_gui.qt.get_swap_history",
+        with mock.patch("swapserver_gui.qt.build_served_swap_rows",
                         side_effect=RuntimeError("boom")):
             tab.refresh()  # must not raise into the 4s timer
+
+    def test_double_clicking_a_row_opens_the_component_window(self):
+        tab, _, _, _ = self._make_tab()
+        rows = [_row()]
+        with mock.patch("swapserver_gui.qt.build_served_swap_rows", return_value=rows):
+            tab.refresh()
+        tab.on_history_row_activated(self._history_rows(tab)[0], 0)
+        self.assertEqual(len(tab._detail_dialogs), 1)
+        dialog = tab._detail_dialogs[0]
+        self.assertIs(dialog.row, rows[0])
+        # It must not be modal: the window it sends the user to is the one a
+        # window-modal dialog would block.
+        self.assertEqual(dialog.windowModality(), Qt.WindowModality.NonModal)
+
+    def test_closing_the_component_window_drops_our_reference(self):
+        tab, _, _, _ = self._make_tab()
+        with mock.patch("swapserver_gui.qt.build_served_swap_rows", return_value=[_row()]):
+            tab.refresh()
+        tab.on_history_row_activated(self._history_rows(tab)[0], 0)
+        tab._detail_dialogs[0].close()
+        self.assertEqual(tab._detail_dialogs, [])
+
+    def test_tearing_down_the_tab_closes_open_component_windows(self):
+        tab, _, _, _ = self._make_tab()
+        with mock.patch("swapserver_gui.qt.build_served_swap_rows", return_value=[_row()]):
+            tab.refresh()
+        tab.on_history_row_activated(self._history_rows(tab)[0], 0)
+        tab.clean_up()
+        self.assertEqual(tab._detail_dialogs, [])
+
+
+@unittest.skipUnless(HAVE_QT, "PyQt6 not installed")
+class SwapComponentsDialogTests(_TabHarness, unittest.TestCase):
+    """The window a double-click opens: every leg of one swap."""
+
+    def _dialog(self, row=None):
+        from swapserver_gui import qt as qt_mod
+        tab, _, _, window = self._make_tab()
+        dialog = qt_mod.SwapComponentsDialog(tab, row or _row())
+        self.addCleanup(dialog.deleteLater)
+        return dialog, window
+
+    def _component_items(self, dialog):
+        tree = dialog.tree
+        return [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+
+    def test_lists_every_component(self):
+        dialog, _ = self._dialog()
+        titles = [item.text(0) for item in self._component_items(dialog)]
+        self.assertEqual(titles, ["Lightning payment", "Funding transaction",
+                                  "Claim transaction"])
+
+    def test_a_leg_the_taker_made_is_marked_as_such(self):
+        dialog, _ = self._dialog()
+        by_title = {i.text(0): i for i in self._component_items(dialog)}
+        self.assertEqual(by_title["Funding transaction"].text(2), "made by the taker")
+        self.assertEqual(by_title["Claim transaction"].text(2),
+                         "in this wallet's history")
+
+    def test_clicking_our_leg_goes_to_the_history_tab(self):
+        dialog, _ = self._dialog()
+        item = {i.text(0): i for i in self._component_items(dialog)}["Claim transaction"]
+        with mock.patch("swapserver_gui.qt.show_in_history", return_value=True) as go:
+            dialog.on_component_activated(item, 0)
+        go.assert_called_once()
+        self.assertEqual(go.call_args.kwargs["txid"], "tx_claim")
+        self.assertFalse(dialog.status_label.isVisible())
+
+    def test_clicking_the_takers_leg_explains_why_nothing_happens(self):
+        dialog, _ = self._dialog()
+        item = {i.text(0): i for i in self._component_items(dialog)}["Funding transaction"]
+        with mock.patch("swapserver_gui.qt.show_in_history") as go:
+            dialog.on_component_activated(item, 0)
+        go.assert_not_called()
+        self.assertIn("not in this wallet", dialog.status_label.text())
+
+    def test_a_leg_that_cannot_be_found_says_so(self):
+        dialog, _ = self._dialog()
+        item = {i.text(0): i for i in self._component_items(dialog)}["Claim transaction"]
+        with mock.patch("swapserver_gui.qt.show_in_history", return_value=False):
+            dialog.on_component_activated(item, 0)
+        self.assertIn("Could not find", dialog.status_label.text())
+
+    def test_a_shared_transaction_is_explained(self):
+        dialog, _ = self._dialog(_row(batched_with=2))
+        texts = [w.text() for w in dialog.findChildren(QLabel)]
+        self.assertTrue(any("2 other" in t for t in texts), texts)
+
+
+@unittest.skipUnless(HAVE_QT, "PyQt6 not installed")
+class ShowInHistoryTests(unittest.TestCase):
+    """Selecting a transaction in Electrum's History tab.
+
+    ``history_list.py`` has no plugin hook, so this drives HistoryModel's tree
+    directly.  The stand-in below is a real ``CustomModel`` -- the same class
+    HistoryModel is built on -- so the index arithmetic is the real thing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self, top_level):
+        """A window whose History tab holds ``top_level`` = [(item, children)]."""
+        from electrum.gui.qt.custom_model import CustomModel, CustomNode
+        from PyQt6.QtCore import QSortFilterProxyModel
+        from PyQt6.QtWidgets import QTreeView, QVBoxLayout, QWidget
+
+        class _Node(CustomNode):
+            def get_data_for_role(self, index, role):
+                return None
+
+        model = CustomModel(None, 3)
+        for item, children in top_level:
+            node = _Node(model, item)
+            model._root.addChild(node)
+            for child in children:
+                node.addChild(_Node(model, child))
+        proxy = QSortFilterProxyModel()
+        proxy.setSourceModel(model)
+        view = QTreeView()
+        view.setModel(proxy)
+
+        window = QWidget()
+        self.addCleanup(window.deleteLater)
+        tabs = QTabWidget(window)
+        page = QWidget()
+        QVBoxLayout(page).addWidget(view)  # the list is nested, as in Electrum
+        tabs.addTab(QWidget(), "Send")
+        tabs.addTab(page, "History")
+        window.tabs = tabs
+        window.history_list = view
+        window.history_model = model
+        return window
+
+    def test_finds_a_top_level_transaction_and_switches_tab(self):
+        from swapserver_gui import qt as qt_mod
+        window = self._window([({'txid': 'tx1', 'lightning': False}, [])])
+        self.assertTrue(qt_mod.show_in_history(window, txid='tx1'))
+        self.assertEqual(window.tabs.currentIndex(), 1)
+        index = window.history_list.currentIndex()
+        self.assertEqual(index.row(), 0)
+        # CustomModel.parent() hands back a *valid* index for a top-level row
+        # (it points at the root node), so "has a parent" is not the test for
+        # "is inside a group" -- nothing here should have been expanded.
+        self.assertFalse(window.history_list.isExpanded(index))
+
+    def test_finds_a_transaction_folded_into_a_group(self):
+        from swapserver_gui import qt as qt_mod
+        window = self._window([
+            ({'txid': '----', 'lightning': False},
+             [{'txid': 'tx_child', 'lightning': False},
+              {'payment_hash': 'ph1', 'lightning': True}]),
+        ])
+        self.assertTrue(qt_mod.show_in_history(window, txid='tx_child'))
+        index = window.history_list.currentIndex()
+        self.assertTrue(index.parent().isValid())  # it really is the child row
+        self.assertTrue(window.history_list.isExpanded(index.parent()))
+
+    def test_finds_a_lightning_payment_by_hash(self):
+        from swapserver_gui import qt as qt_mod
+        window = self._window([({'payment_hash': 'ph1', 'lightning': True}, [])])
+        self.assertTrue(qt_mod.show_in_history(window, payment_hash='ph1'))
+
+    def test_missing_transaction_reports_failure(self):
+        from swapserver_gui import qt as qt_mod
+        window = self._window([({'txid': 'tx1', 'lightning': False}, [])])
+        self.assertFalse(qt_mod.show_in_history(window, txid='nope'))
+
+    def test_window_without_a_history_tab(self):
+        from swapserver_gui import qt as qt_mod
+        self.assertFalse(qt_mod.show_in_history(mock.Mock(spec=[]), txid='tx1'))
+
+    def test_tab_lookup_walks_up_from_a_nested_widget(self):
+        from swapserver_gui import qt as qt_mod
+        window = self._window([({'txid': 'tx1', 'lightning': False}, [])])
+        self.assertEqual(
+            qt_mod._tab_index_for_widget(window.tabs, window.history_list), 1)
+        self.assertEqual(qt_mod._tab_index_for_widget(window.tabs, None), -1)
 
 
 if __name__ == '__main__':
