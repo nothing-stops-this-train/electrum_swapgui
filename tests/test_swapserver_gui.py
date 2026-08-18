@@ -728,7 +728,7 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(
             get_swap_summary([]),
             {'num_swaps': 0, 'overall_return_sat': 0, 'swaps_per_day': 0.0,
-             'num_batched': 0},
+             'num_batched': 0, 'num_incomplete': 0, 'num_unattributed': 0},
         )
 
     def test_aggregates_and_rate(self):

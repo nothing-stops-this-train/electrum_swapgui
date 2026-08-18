@@ -103,6 +103,11 @@ def _make_wallet(db: WalletDB, config: _Config) -> Any:
     # swap -- so these have to be pinned rather than left to auto-speccing.
     wallet.lnworker.get_preimage.return_value = None
     wallet.lnworker.has_payment_bundle.return_value = False
+    # What get_full_history will find to group the on-chain legs with. Empty by
+    # default; a test that cares sets it, because whether a swap group has a
+    # lightning member decides whether the group survives to be expanded (see
+    # relabel_swap_history_groups).
+    wallet.lnworker.get_lightning_history.return_value = {}
     return wallet
 
 
@@ -377,6 +382,10 @@ class ServedSwapsE2ETest(unittest.TestCase):
         # upstream reads the spending tx back to look for a preimage; there is
         # no chain here, so tell it there is no such transaction.
         self.wallet.lnworker.lnwatcher.adb.get_transaction.return_value = None
+        # both swaps paid/were paid over lightning, so both groups have a
+        # lightning member and neither will be collapsed into its leg
+        self.wallet.lnworker.get_lightning_history.return_value = {
+            served_forward: None, own_forward: None}
 
         groups = self.sm.get_groups_for_onchain_history()
         labels = {txid: entry['group_label'] for txid, entry in groups.items()}
@@ -393,6 +402,26 @@ class ServedSwapsE2ETest(unittest.TestCase):
         groups = self.sm.get_groups_for_onchain_history()
         self.assertIn('Reverse swap', groups['tx_claim']['group_label'])
 
+    def test_a_swap_with_no_lightning_leg_is_named_on_its_claim_tx(self) -> None:
+        """The orphan "Claim transaction" case, against the real group builder.
+
+        With no lightning payment the group has a single member, and
+        ``get_full_history`` shows a single-member group as that member, under
+        its *leg* label -- so rewriting only ``group_label`` leaves the operator
+        looking at a bare "Claim transaction" that belongs to no visible swap.
+        """
+        self._start_server()
+        served_forward = self._serve_taker_forward_swap()
+        self._confirm(served_forward, funding='tx_f', spending='tx_claim')
+        self.wallet.lnworker.lnwatcher.adb.get_transaction.return_value = None
+        self.wallet.lnworker.get_lightning_history.return_value = {}
+
+        groups = self.sm.get_groups_for_onchain_history()
+        self.assertIn('Served forward swap', groups['tx_claim']['group_label'])
+        # the label that will actually be displayed
+        self.assertIn('Served forward swap', groups['tx_claim']['label'])
+        self.assertNotIn('Claim transaction', groups['tx_claim']['label'])
+
     def test_classification_survives_a_wallet_file_round_trip(self) -> None:
         self._start_server()
         served = self._serve_taker_reverse_swap()
@@ -408,18 +437,44 @@ class ServedSwapsE2ETest(unittest.TestCase):
         reloaded_sm = _make_swap_manager(reloaded_wallet)
         self.assertEqual(set(reloaded_sm._swaps), {served, own})
         swap = reloaded_sm._swaps[served]
+        # The taker pays a served reverse swap in two parts -- the hold invoice
+        # and the mining-fee prepayment (create_normal_swap, prepay=True) -- and
+        # both have to be in the history for the row to be a complete one.
+        prepay_sat = 2 * reloaded_sm.mining_fee
         reloaded_wallet.get_full_history.return_value = _history(
             _onchain('tx_served_funding', -swap.onchain_amount - 300, fee=300,
                      ts=1_700_000_000),
-            _ln(served, swap.lightning_amount, ts=1_700_000_000),
+            _ln(served, swap.lightning_amount - prepay_sat, ts=1_700_000_000),
+            _ln(swap.prepay_hash.hex(), prepay_sat, ts=1_700_000_000),
             _onchain('tx_own_funding', -900, fee=100, ts=1_700_000_200),
         )
 
         rows = build_served_swap_rows(reloaded_wallet)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].payment_hash, served)
+        self.assertTrue(rows[0].is_complete)
         self.assertEqual(rows[0].return_sat,
                          swap.lightning_amount - swap.onchain_amount - 300)
+
+    def test_a_missing_prepayment_leaves_the_return_unstated(self) -> None:
+        """Without the prepayment the sum is short by it, not smaller by it."""
+        self._start_server()
+        served = self._serve_taker_reverse_swap()
+        self._confirm(served, funding='tx_served_funding', spending='tx_served_claim')
+        swap = self.sm._swaps[served]
+        self.wallet.get_full_history.return_value = _history(
+            _onchain('tx_served_funding', -swap.onchain_amount - 300, fee=300,
+                     ts=1_700_000_000),
+            _ln(served, swap.lightning_amount - 2 * self.sm.mining_fee,
+                ts=1_700_000_000),
+        )
+
+        rows = build_served_swap_rows(self.wallet)
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0].is_complete)
+        self.assertIsNone(rows[0].return_sat)
+        self.assertEqual(get_swap_summary(rows)['num_incomplete'], 1)
+        self.assertEqual(get_swap_summary(rows)['overall_return_sat'], 0)
 
     def test_recorder_is_removed_when_the_server_stops(self) -> None:
         self._start_server()
