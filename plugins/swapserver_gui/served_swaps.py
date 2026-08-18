@@ -13,7 +13,22 @@
 #      the claim transaction -- so one swap is one row and the components are
 #      reachable from it;
 #   3. attribute a real per-swap return even when Electrum settles several
-#      swaps in a single transaction.
+#      swaps in a single transaction -- or say that it cannot.
+#
+# On (1): three of the four ways a swap reaches the wallet are named by fields
+# only one side writes; the fourth -- our own reverse swap against a server that
+# sent no ``minerFeeInvoice`` -- is field-identical to a forward swap we served,
+# and is settled by :func:`swap_margin_sat` instead, because the server is by
+# construction the side that comes out ahead.  See :func:`classify_swap`.
+#
+# On (3): a leg of ours that is not in the wallet's history has an *unknown*
+# value, not a zero one.  Adding up the rest yields a number that reads as a
+# result and is not one -- for a served reverse swap missing its prepayment it
+# reads as a loss the swap never made, and for a claim with no lightning payment
+# behind it, as revenue the swap never earned.  Such a row reports
+# ``return_sat=None`` and names the legs it is short of; see
+# :attr:`ServedSwapRow.missing_legs` and :func:`get_swap_summary`, which leaves
+# those rows out of the total rather than folding a partial sum into it.
 #
 # On (3): every swap claim and every swap funding output is handed to the *same*
 # transaction batch, keyed ``'swaps'`` (electrum/submarine_swaps.py: the
@@ -33,7 +48,7 @@ import time
 from datetime import datetime
 from enum import Enum
 from typing import (TYPE_CHECKING, Any, Dict, Hashable, List, NamedTuple,
-                    Optional, Sequence, Tuple, TypeVar)
+                    Optional, Sequence, Set, Tuple, TypeVar)
 
 from electrum.i18n import _
 from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED
@@ -123,11 +138,87 @@ def looks_server_side(swap: Any) -> bool:
             and getattr(swap, 'claim_to_output', None) is None)
 
 
-def is_served_swap(swap: Any, payment_hash_hex: str, ledger: Dict[str, int]) -> bool:
-    """True when ``swap`` was created for a remote taker by our swap server."""
+class SwapRole(Enum):
+    """Which side of a swap this wallet was on."""
+
+    SERVED = 'served'   #: our server created it for a remote taker
+    OWN = 'own'         #: we were the customer
+    UNKNOWN = 'unknown'  #: the records do not say, and cannot be made to say
+
+
+def swap_margin_sat(swap: Any) -> int:
+    """What this wallet stood to gain from ``swap``, per the agreed amounts.
+
+    The two sides of a swap are not symmetric in one respect that is always
+    recorded: the server is, by construction, the side that comes out ahead.
+    Both fee calculations in electrum/submarine_swaps.py are one-directional --
+    ``_get_send_amount`` adds ``percentage_fee + mining_fee`` and
+    ``_get_recv_amount`` subtracts them -- so:
+
+    * we receive on-chain and pay lightning (``is_reverse``):
+      ``onchain_amount > lightning_amount`` exactly when we are the server;
+    * we pay on-chain and receive lightning:
+      ``lightning_amount > onchain_amount`` exactly when we are the server.
+
+    Returns the signed margin, so ``> 0`` means we were the server.  Zero means
+    the amounts agree, which only happens against a server charging neither a
+    percentage nor a mining fee; the caller has to fall back for that.
+    """
+    onchain = int(getattr(swap, 'onchain_amount', 0) or 0)
+    lightning = int(getattr(swap, 'lightning_amount', 0) or 0)
+    return (onchain - lightning) if getattr(swap, 'is_reverse', False) \
+        else (lightning - onchain)
+
+
+def classify_swap(swap: Any, payment_hash_hex: str, ledger: Dict[str, int]) -> SwapRole:
+    """Which side of ``swap`` this wallet was on, and how sure we can be.
+
+    In order of authority:
+
+    1. the ledger, which recorded the swap as our server created it;
+    2. the fields that only ever one side writes -- see :func:`looks_server_side`
+       for the table.  ``claim_to_output`` is set by the customer alone, and a
+       prepay hash is set by the server on a swap it funds and by the customer
+       on a swap it is funded for, so ``is_reverse`` plus ``prepay_hash``
+       settles three of the four creation paths outright;
+    3. :func:`swap_margin_sat`, for the one path the fields do not settle: our
+       own reverse swap against a server that sent no ``minerFeeInvoice`` is
+       field-identical to a forward swap we served.  The docstring of
+       :func:`looks_server_side` used to write that case off as not arising in
+       practice; it does arise, and it lands a swap we *paid* for in the served
+       table with its cost reported as revenue.
+
+    :data:`SwapRole.UNKNOWN` is returned rather than a guess when even the
+    margin is silent, so the caller can say so instead of reporting a number
+    whose sign it cannot justify.
+    """
     if payment_hash_hex in ledger:
-        return True
-    return looks_server_side(swap)
+        return SwapRole.SERVED
+    if not getattr(swap, 'is_reverse', False):
+        # create_normal_swap hardcodes prepay=True for the server and
+        # request_normal_swap hardcodes prepay=False for the customer.
+        return SwapRole.SERVED if getattr(swap, 'prepay_hash', None) is not None \
+            else SwapRole.OWN
+    if getattr(swap, 'claim_to_output', None) is not None:
+        return SwapRole.OWN   # only reverse_swap, the customer's path, sets it
+    if getattr(swap, 'prepay_hash', None) is not None:
+        return SwapRole.OWN   # create_reverse_swap, the server's path, never does
+    margin = swap_margin_sat(swap)
+    if margin > 0:
+        return SwapRole.SERVED
+    if margin < 0:
+        return SwapRole.OWN
+    return SwapRole.UNKNOWN
+
+
+def is_served_swap(swap: Any, payment_hash_hex: str, ledger: Dict[str, int]) -> bool:
+    """True when ``swap`` was created for a remote taker by our swap server.
+
+    An unclassifiable swap counts as served, so it stays visible in the Swap
+    Server tab; :attr:`ServedSwapRow.role` carries the uncertainty on to the
+    row, which reports itself as uncertain rather than contributing a number.
+    """
+    return classify_swap(swap, payment_hash_hex, ledger) is not SwapRole.OWN
 
 
 def taker_did_forward_swap(swap: Any, *, served: bool) -> bool:
@@ -268,11 +359,20 @@ class SwapComponent(NamedTuple):
     value_sat: Optional[int]
     in_wallet: bool
     detail: str
+    #: Whether this leg is one this wallet made, and so one whose value has to
+    #: be known before the swap's return adds up.  False for the leg the
+    #: counterparty made, which is absent from our history by design.
+    expected_ours: bool = True
 
     @property
     def is_onchain(self) -> bool:
         return self.kind in (ComponentKind.FUNDING_TX, ComponentKind.CLAIM_TX,
                              ComponentKind.REFUND_TX)
+
+    @property
+    def is_missing(self) -> bool:
+        """Ours, but not in the wallet's history -- so its value is unknown."""
+        return self.expected_ours and not self.in_wallet
 
 
 class ServedSwapRow(NamedTuple):
@@ -282,7 +382,10 @@ class ServedSwapRow(NamedTuple):
     label: str
     date: str
     timestamp: int
-    return_sat: int
+    #: This swap's return, or ``None`` when a leg of ours is missing from the
+    #: wallet's history and the sum would therefore be a partial one.  Never a
+    #: number that is not the whole of what happened; see :attr:`missing_legs`.
+    return_sat: Optional[int]
     taker_is_forward: bool
     components: List[SwapComponent]
     lockup_address: str
@@ -292,10 +395,29 @@ class ServedSwapRow(NamedTuple):
     #: How many *other* swaps were settled by the same on-chain transaction(s).
     #: Informational only: this row's value is this swap's alone.
     batched_with: int
+    #: Which side of the swap we were on, and whether that could be established.
+    role: 'SwapRole' = SwapRole.SERVED
+    #: Titles of the legs that are ours but not in the wallet's history.
+    missing_legs: Tuple[str, ...] = ()
 
     @property
     def wallet_components(self) -> List[SwapComponent]:
         return [c for c in self.components if c.in_wallet]
+
+    @property
+    def is_complete(self) -> bool:
+        """True when every leg of ours is accounted for, so the return is real."""
+        return not self.missing_legs
+
+    @property
+    def counts_towards_total(self) -> bool:
+        """True when this row may be added into the net return.
+
+        A row is excluded when a leg is missing (the sum would be partial) or
+        when we could not establish which side of the swap we were on (the sign
+        would be meaningless).
+        """
+        return self.is_complete and self.role is SwapRole.SERVED
 
 
 class _Leg(NamedTuple):
@@ -493,7 +615,8 @@ def build_served_swap_rows(wallet: 'Abstract_Wallet') -> List[ServedSwapRow]:
 
     rows: List[ServedSwapRow] = []
     for payment_hash, swap in swaps:
-        if not is_served_swap(swap, payment_hash, ledger):
+        role = classify_swap(swap, payment_hash, ledger)
+        if role is SwapRole.OWN:
             continue
         spending_txid = getattr(swap, 'spending_txid', None)
         if spending_txid is None:
@@ -501,7 +624,7 @@ def build_served_swap_rows(wallet: 'Abstract_Wallet') -> List[ServedSwapRow]:
         if wallet.adb.get_tx_height(spending_txid).height() <= TX_HEIGHT_UNCONFIRMED:
             continue  # only final swaps, so the history is stable
         row = _build_row(
-            sm=sm, wallet=wallet, payment_hash=payment_hash, swap=swap,
+            sm=sm, wallet=wallet, payment_hash=payment_hash, swap=swap, role=role,
             onchain_items=onchain_items, ln_items=ln_items,
             net_by_leg=net_by_leg, legs_by_tx=legs_by_tx, swaps_per_tx=swaps_per_tx,
         )
@@ -516,6 +639,7 @@ def _build_row(
         wallet: 'Abstract_Wallet',
         payment_hash: str,
         swap: Any,
+        role: SwapRole,
         onchain_items: Dict[str, Any],
         ln_items: Dict[str, Any],
         net_by_leg: Dict[Tuple[str, str], int],
@@ -523,6 +647,7 @@ def _build_row(
         swaps_per_tx: Dict[str, int],
 ) -> Optional[ServedSwapRow]:
     taker_is_forward = taker_did_forward_swap(swap, served=True)
+    is_reverse = bool(getattr(swap, 'is_reverse', False))
     funding_txid = getattr(swap, 'funding_txid', None)
     spending_txid = getattr(swap, 'spending_txid', None)
     prepay_hash = getattr(swap, 'prepay_hash', None)
@@ -533,6 +658,10 @@ def _build_row(
     timestamps: List[int] = []
 
     # ---- lightning legs -------------------------------------------------
+    # Both sides of a swap have a lightning leg, so ours is always expected.
+    # When it is absent the swap did not settle the way the amounts say it did
+    # -- the taker never paid, or the payment is in a channel this wallet no
+    # longer has -- and the value of that leg is not zero, it is unknown.
     ln_item = ln_items.get(payment_hash)
     ln_value = _ln_value_sat(ln_item)
     if ln_value is not None:
@@ -550,6 +679,7 @@ def _build_row(
         detail=(_("Paid to the taker in exchange for their on-chain funds.")
                 if taker_is_forward
                 else _("Received from the taker in exchange for our on-chain funds.")),
+        expected_ours=True,
     ))
     if prepay_hex:
         prepay_item = ln_items.get(prepay_hex)
@@ -568,11 +698,12 @@ def _build_row(
             in_wallet=prepay_item is not None,
             detail=_("Settled immediately, so the funding transaction's mining "
                      "fee is covered even if the swap is never completed."),
+            expected_ours=True,
         ))
 
     # ---- on-chain legs --------------------------------------------------
     def add_onchain(kind: ComponentKind, title: str, txid: Optional[str],
-                    theirs_detail: str, ours_detail: str) -> None:
+                    theirs_detail: str, ours_detail: str, expected_ours: bool) -> None:
         nonlocal total
         if not txid:
             return
@@ -587,15 +718,21 @@ def _build_row(
             kind=kind, title=title, txid=txid, payment_hash=None,
             value_sat=value, in_wallet=ours,
             detail=ours_detail if ours else theirs_detail,
+            expected_ours=expected_ours,
         ))
 
+    # Which on-chain leg is ours follows from the direction: we fund the lockup
+    # of a swap we serve a taker's reverse swap with, and we claim the lockup of
+    # one we serve their forward swap with.  The other leg is the taker's, and
+    # its absence from our history is normal rather than a gap.
     add_onchain(
         ComponentKind.FUNDING_TX, _("Funding transaction"), funding_txid,
         theirs_detail=_("Made by the taker; this wallet only watches the lockup "
                         "address, so it is not in its history."),
         ours_detail=_("Pays the swap amount into the lockup address."),
+        expected_ours=not is_reverse,
     )
-    is_refund = (not getattr(swap, 'is_reverse', False)
+    is_refund = (not is_reverse
                  and getattr(swap, 'preimage', None) is None
                  and spending_txid in onchain_items)
     add_onchain(
@@ -607,6 +744,7 @@ def _build_row(
         ours_detail=(_("Takes the swap amount back after the swap timed out.")
                      if is_refund
                      else _("Spends the lockup output, revealing the preimage.")),
+        expected_ours=is_reverse or is_refund,
     )
 
     if not timestamps:
@@ -616,15 +754,18 @@ def _build_row(
         (swaps_per_tx.get(txid, 1) - 1
          for txid in {c.txid for c in components if c.is_onchain and c.in_wallet and c.txid}),
         default=0)
+    # A leg of ours that is not in the history has an unknown value, not a zero
+    # one, so ``total`` is a partial sum and must not be presented as a return.
+    missing_legs = tuple(c.title for c in components if c.is_missing)
     return ServedSwapRow(
         payment_hash=payment_hash,
         label=format_swap_label(
-            served=True, taker_is_forward=taker_is_forward,
+            role=role, taker_is_forward=taker_is_forward,
             is_submarine_payment=bool(getattr(swap, 'claim_to_output', None)),
             amount_str=_format_amount(sm, swap_amount_sat(swap))),
         date=_format_date(timestamp),
         timestamp=timestamp,
-        return_sat=total,
+        return_sat=None if missing_legs else total,
         taker_is_forward=taker_is_forward,
         components=components,
         lockup_address=getattr(swap, 'lockup_address', '') or '',
@@ -632,6 +773,8 @@ def _build_row(
         onchain_amount_sat=int(getattr(swap, 'onchain_amount', 0) or 0),
         lightning_amount_sat=int(getattr(swap, 'lightning_amount', 0) or 0),
         batched_with=batched_with,
+        role=role,
+        missing_legs=missing_legs,
     )
 
 
@@ -669,11 +812,13 @@ def swap_amount_sat(swap: Any) -> int:
 SERVED_LABEL_MARK = "⇄"   # ⇄
 #: Prefixed to the history label of a swap the operator initiated themselves.
 OWN_LABEL_MARK = "↪"      # ↪
+#: Prefixed to the history label of a swap whose side could not be established.
+UNKNOWN_LABEL_MARK = "⇄?"
 
 
 def format_swap_label(
         *,
-        served: bool,
+        role: SwapRole,
         taker_is_forward: bool,
         is_submarine_payment: bool,
         amount_str: str,
@@ -693,13 +838,32 @@ def format_swap_label(
         kind = _("forward swap")
     else:
         kind = _("reverse swap")
-    if served:
+    if role is SwapRole.SERVED:
         text = _("Served {kind}").format(kind=kind)
         mark = SERVED_LABEL_MARK
-    else:
+    elif role is SwapRole.OWN:
         text = _("My {kind}").format(kind=kind)
         mark = OWN_LABEL_MARK
+    else:
+        text = _("Unattributed {kind}").format(kind=kind)
+        mark = UNKNOWN_LABEL_MARK
     return f"{mark} {text} {amount_str}".rstrip()
+
+
+def lightning_payment_hashes(wallet: 'Abstract_Wallet') -> Set[str]:
+    """The payment hashes the wallet's lightning history will show.
+
+    ``LNWallet.get_lightning_history`` is what ``get_full_history`` itself
+    calls, so membership here is exactly the question "will this swap have a
+    lightning row to be grouped with".  It walks settled htlcs in the wallet's
+    *current* channels, so a payment whose channel is gone is absent from it
+    even though the swap record survives.
+    """
+    lnworker = getattr(wallet, 'lnworker', None)
+    try:
+        return {key for key in lnworker.get_lightning_history()}
+    except Exception:
+        return set()
 
 
 def relabel_swap_history_groups(
@@ -707,32 +871,64 @@ def relabel_swap_history_groups(
         sm: 'SwapManager',
         groups: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Dict[str, Any]]:
-    """Rewrite the ``group_label`` of every swap group in ``groups`` in place.
+    """Rewrite the labels of every swap group in ``groups`` in place.
 
     ``groups`` is what ``SwapManager.get_groups_for_onchain_history`` returns:
-    ``{txid: {'group_id':…, 'label':…, 'group_label':…}}``.  Only the group
-    label changes; the per-leg ``label`` ("Funding transaction", "Claim
-    transaction") is already the component name and stays as it is.
+    ``{txid: {'group_id':…, 'label':…, 'group_label':…}}``.  Normally only the
+    group label changes, because the per-leg ``label`` ("Funding transaction",
+    "Claim transaction") is the component name and is what the operator wants to
+    read *inside* an expanded group.
+
+    The exception is a group that will not survive to be expanded.
+    ``Abstract_Wallet.get_full_history`` replaces a group by its single member
+    when it has only one (``if len(children) == 1: transactions[key] =
+    children[0]``), and the replacement is displayed under the *leg* label --
+    the group label, and with it everything this function does, never reaches
+    the screen.  That is why a swap whose lightning payment is missing from the
+    wallet shows up in the history as a bare "Claim transaction" with no swap
+    row anywhere: on-chain leg alone, group of one, collapsed.  So when a group
+    is going to collapse, the leg label is overwritten too.
 
     Upstream rebuilds this mapping -- and re-applies the labels it carries -- on
     every history refresh, which is why this has to run as a wrapper around it
     rather than as a one-off write of ``wallet.set_group_label``.
     """
     ledger = served_swaps_ledger(wallet)
+    onchain_members: Dict[str, int] = {}
+    for entry in groups.values():
+        group_id = entry.get('group_id')
+        if group_id:
+            onchain_members[group_id] = onchain_members.get(group_id, 0) + 1
+    ln_hashes: Optional[Set[str]] = None
+
     for payment_hash, swap in list(sm._swaps.items()):
         group_id = swap.spending_txid if swap.is_reverse else swap.funding_txid
         if group_id is None:
             continue
-        served = is_served_swap(swap, payment_hash, ledger)
+        role = classify_swap(swap, payment_hash, ledger)
         label = format_swap_label(
-            served=served,
-            taker_is_forward=taker_did_forward_swap(swap, served=served),
+            role=role,
+            taker_is_forward=taker_did_forward_swap(
+                swap, served=role is not SwapRole.OWN),
             is_submarine_payment=bool(getattr(swap, 'claim_to_output', None)),
             amount_str=_format_amount(sm, swap_amount_sat(swap)),
         )
-        for entry in groups.values():
-            if entry.get('group_id') == group_id:
-                entry['group_label'] = label
+        collapses = False
+        if onchain_members.get(group_id, 0) <= 1:
+            # Only then can the lightning legs make the difference, so only then
+            # is it worth asking the lnworker for them.
+            if ln_hashes is None:
+                ln_hashes = lightning_payment_hashes(wallet)
+            prepay_hash = getattr(swap, 'prepay_hash', None)
+            prepay_hex = prepay_hash.hex() if isinstance(prepay_hash, bytes) else prepay_hash
+            collapses = not (payment_hash in ln_hashes
+                             or (prepay_hex is not None and prepay_hex in ln_hashes))
+        for txid, entry in groups.items():
+            if entry.get('group_id') != group_id:
+                continue
+            entry['group_label'] = label
+            if collapses and txid == group_id:
+                entry['label'] = label
     return groups
 
 
@@ -758,9 +954,21 @@ def get_swap_summary(rows: Sequence[Any]) -> Dict[str, Any]:
 
     if not rows:
         return {'num_swaps': 0, 'overall_return_sat': 0, 'swaps_per_day': 0.0,
-                'num_batched': 0}
+                'num_batched': 0, 'num_incomplete': 0, 'num_unattributed': 0}
     num_batched = sum(1 for row in rows if field(row, 'batched_with'))
-    profit_loss_sum = sum(int(field(row, 'return_sat')) for row in rows)
+    # Only rows whose every leg is in the wallet, and whose side we could
+    # establish, may be added up: a partial sum is not a smaller return, and an
+    # unattributed swap's sign says nothing.  Counting them separately is what
+    # keeps the total honest instead of quietly wrong.
+    num_incomplete = sum(1 for row in rows if field(row, 'missing_legs', ()))
+    num_unattributed = sum(
+        1 for row in rows
+        if field(row, 'role', SwapRole.SERVED) is SwapRole.UNKNOWN)
+    profit_loss_sum = sum(
+        int(field(row, 'return_sat'))
+        for row in rows
+        if field(row, 'return_sat') is not None
+        and field(row, 'role', SwapRole.SERVED) is SwapRole.SERVED)
     timestamps = [int(field(row, 'timestamp')) for row in rows]
     days = (max(timestamps) - min(timestamps)) // 86400
     swaps_per_day = (len(rows) / days) if days > 0 else 0.0
@@ -769,6 +977,8 @@ def get_swap_summary(rows: Sequence[Any]) -> Dict[str, Any]:
         'overall_return_sat': profit_loss_sum,
         'swaps_per_day': round(swaps_per_day, 2),
         'num_batched': num_batched,
+        'num_incomplete': num_incomplete,
+        'num_unattributed': num_unattributed,
     }
 
 
@@ -778,17 +988,33 @@ def format_summary_line(
         net_return: str,
         swaps_per_day: float,
         num_batched: int,
+        num_incomplete: int = 0,
+        num_unattributed: int = 0,
 ) -> str:
     """The one-line summary above the history table.
 
     Pure, and here rather than in ``qt.py``, so it is testable without PyQt6
     (same reasoning as :func:`save_settings`).  ``net_return`` arrives
     pre-formatted because only the GUI knows the user's unit settings.
+
+    The net return covers only the rows it can: any row left out of it is
+    counted out loud on a second line, because a total that silently drops rows
+    reads exactly like a total that includes them.
     """
     text = _("Swaps served: {num} · net return: {ret} · {rate}/day").format(
         num=num_swaps, ret=net_return, rate=swaps_per_day)
     if num_batched:
         text += " · " + _("{n} settled in a shared transaction").format(n=num_batched)
+    notes = []
+    if num_incomplete:
+        notes.append(_("{n} incomplete (a leg is not in this wallet)").format(
+            n=num_incomplete))
+    if num_unattributed:
+        notes.append(_("{n} unattributed (could not tell which side we were on)").format(
+            n=num_unattributed))
+    if notes:
+        text += "\n" + _("Not counted in the net return: {what}").format(
+            what=" · ".join(notes))
     return text
 
 
@@ -806,3 +1032,32 @@ def format_batched_note(*, batched_with: int) -> str:
         "swap(s).\nThe return shown is this swap's own share: its legs, minus "
         "its share of that transaction's mining fee."
     ).format(n=batched_with)
+
+
+def format_incomplete_note(*, missing_legs: Sequence[str]) -> str:
+    """Why a row shows no return.
+
+    Naming the leg matters: "the lightning payment is not in this wallet" is
+    something the operator can act on -- the taker never paid, or the channel
+    that carried the payment is gone -- whereas a number that quietly left the
+    leg out at zero would just look like a loss the swap never made.
+    """
+    return _(
+        "No return is shown because {n} leg(s) of this swap are not in this "
+        "wallet's history:\n{legs}\n\nTheir value is unknown, not zero, so "
+        "adding up the remaining legs would understate or overstate the swap."
+    ).format(n=len(missing_legs), legs="\n".join("· " + leg for leg in missing_legs))
+
+
+def format_unattributed_note() -> str:
+    """Why a row will not say whose swap it was.
+
+    A reverse swap we made as a customer against a server that sent no
+    ``minerFeeInvoice`` records exactly the fields our own server records for a
+    forward swap it serves, and the amounts agree too, so nothing in the wallet
+    distinguishes them.  See :func:`classify_swap`.
+    """
+    return _(
+        "This swap's records do not say which side of it this wallet was on, "
+        "and the amounts do not settle it either.\nIt is shown here in case it "
+        "was served, but it is left out of the net return.")

@@ -43,7 +43,7 @@ except ImportError:
     HAVE_QT = False
 
 from swapserver_gui.swapserver_gui import (  # noqa: E402
-    AnnounceState, ComponentKind, ServedSwapRow, SwapComponent,
+    AnnounceState, ComponentKind, ServedSwapRow, SwapComponent, SwapRole,
     SwapServerGuiPlugin,
 )
 from swapserver_gui import nostr_check as nc  # noqa: E402
@@ -84,14 +84,16 @@ class _SwapManager:
 
 
 def _component(kind, title, *, txid=None, payment_hash=None, value_sat=None,
-               in_wallet=True):
+               in_wallet=True, expected_ours=True):
     return SwapComponent(kind=kind, title=title, txid=txid,
                          payment_hash=payment_hash, value_sat=value_sat,
-                         in_wallet=in_wallet, detail="why this leg exists")
+                         in_wallet=in_wallet, detail="why this leg exists",
+                         expected_ours=expected_ours)
 
 
 def _row(*, label='⇄ Served forward swap 0.2 mBTC', return_sat=205,
-         payment_hash='aa' * 32, batched_with=0):
+         payment_hash='aa' * 32, batched_with=0, role=SwapRole.SERVED,
+         missing_legs=(), ln_in_wallet=True):
     """A served forward swap: the taker funded, we claimed and paid lightning."""
     return ServedSwapRow(
         payment_hash=payment_hash,
@@ -102,9 +104,13 @@ def _row(*, label='⇄ Served forward swap 0.2 mBTC', return_sat=205,
         taker_is_forward=True,
         components=[
             _component(ComponentKind.LN_PAYMENT, "Lightning payment",
-                       payment_hash=payment_hash, value_sat=-99_000),
+                       payment_hash=payment_hash,
+                       value_sat=-99_000 if ln_in_wallet else None,
+                       in_wallet=ln_in_wallet),
+            # The taker funds a forward swap we serve, so this leg is never in
+            # our history and its absence is not a gap.
             _component(ComponentKind.FUNDING_TX, "Funding transaction",
-                       txid='tx_theirs', in_wallet=False),
+                       txid='tx_theirs', in_wallet=False, expected_ours=False),
             _component(ComponentKind.CLAIM_TX, "Claim transaction",
                        txid='tx_claim', value_sat=99_800),
         ],
@@ -113,7 +119,17 @@ def _row(*, label='⇄ Served forward swap 0.2 mBTC', return_sat=205,
         onchain_amount_sat=100_000,
         lightning_amount_sat=99_000,
         batched_with=batched_with,
+        role=role,
+        missing_legs=missing_legs,
     )
+
+
+def _incomplete_row(**kw):
+    """The shape behind the reported negative returns: a leg of ours missing."""
+    kw.setdefault('return_sat', None)
+    kw.setdefault('missing_legs', ("Lightning payment",))
+    kw.setdefault('ln_in_wallet', False)
+    return _row(**kw)
 
 
 class _TabHarness:
@@ -470,11 +486,48 @@ class QtTabTests(_TabHarness, unittest.TestCase):
             tab.refresh()
         self.assertIn("Swaps served: 1", tab.summary_label.text())
         self.assertNotIn("shared transaction", tab.summary_label.text())
+        self.assertNotIn("Not counted", tab.summary_label.text())
         items = self._history_rows(tab)
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].text(1), '⇄ Served forward swap 0.2 mBTC')
         self.assertEqual(items[0].text(2), '205')
         self.assertIn("component", items[0].toolTip(1))
+
+    def test_a_row_with_a_missing_leg_shows_no_number(self):
+        """No partial sum reaches the screen; it would read as a real result."""
+        tab, _, _, _ = self._make_tab()
+        with mock.patch("swapserver_gui.qt.build_served_swap_rows",
+                        return_value=[_incomplete_row()]):
+            tab.refresh()
+        item = self._history_rows(tab)[0]
+        self.assertNotIn("205", item.text(2))
+        self.assertIn("incomplete", item.text(2))
+        self.assertIn("Lightning payment", item.toolTip(2))
+        self.assertIn("unknown, not zero", item.toolTip(2))
+
+    def test_the_summary_says_what_it_left_out(self):
+        tab, _, _, _ = self._make_tab()
+        rows = [_row(return_sat=205),
+                _incomplete_row(payment_hash='bb' * 32),
+                _row(payment_hash='cc' * 32, return_sat=99, role=SwapRole.UNKNOWN)]
+        with mock.patch("swapserver_gui.qt.build_served_swap_rows", return_value=rows):
+            tab.refresh()
+        text = tab.summary_label.text()
+        self.assertIn("Swaps served: 3", text)
+        self.assertIn("Not counted", text)
+        self.assertIn("incomplete", text)
+        self.assertIn("unattributed", text)
+
+    def test_an_unattributed_row_says_so_and_is_not_counted(self):
+        tab, _, _, _ = self._make_tab()
+        row = _row(label='⇄? Unattributed forward swap 0.2 mBTC', return_sat=99,
+                   role=SwapRole.UNKNOWN)
+        with mock.patch("swapserver_gui.qt.build_served_swap_rows",
+                        return_value=[row]):
+            tab.refresh()
+        item = self._history_rows(tab)[0]
+        self.assertIn("Unattributed", item.text(1))
+        self.assertIn("which side", item.toolTip(2))
 
     def test_two_swaps_sharing_a_transaction_are_two_rows(self):
         """The whole point of the rewrite: a batch tx is not one row."""
@@ -570,6 +623,36 @@ class SwapComponentsDialogTests(_TabHarness, unittest.TestCase):
             dialog.on_component_activated(item, 0)
         go.assert_not_called()
         self.assertIn("not in this wallet", dialog.status_label.text())
+
+    def test_a_leg_of_ours_that_is_missing_reads_differently(self):
+        # "made by the taker" is normal; "missing from this wallet" is the gap
+        # that costs the row its return, so the two must not look the same.
+        dialog, _ = self._dialog(_incomplete_row())
+        by_title = {i.text(0): i for i in self._component_items(dialog)}
+        self.assertEqual(by_title["Lightning payment"].text(2),
+                         "missing from this wallet")
+        self.assertEqual(by_title["Funding transaction"].text(2),
+                         "made by the taker")
+
+    def test_clicking_a_missing_leg_says_why_there_is_no_return(self):
+        dialog, _ = self._dialog(_incomplete_row())
+        item = {i.text(0): i for i in self._component_items(dialog)}["Lightning payment"]
+        with mock.patch("swapserver_gui.qt.show_in_history") as go:
+            dialog.on_component_activated(item, 0)
+        go.assert_not_called()
+        self.assertIn("no return", dialog.status_label.text())
+
+    def test_the_summary_box_withholds_the_return_and_says_why(self):
+        dialog, _ = self._dialog(_incomplete_row())
+        labels = [w.text() for w in dialog.findChildren(QLabel)]
+        self.assertTrue(any("incomplete" in t for t in labels), labels)
+        self.assertTrue(any("Lightning payment" in t and "unknown, not zero" in t
+                            for t in labels), labels)
+
+    def test_an_unattributed_swap_explains_itself(self):
+        dialog, _ = self._dialog(_row(role=SwapRole.UNKNOWN))
+        labels = [w.text() for w in dialog.findChildren(QLabel)]
+        self.assertTrue(any("which side" in t for t in labels), labels)
 
     def test_a_leg_that_cannot_be_found_says_so(self):
         dialog, _ = self._dialog()

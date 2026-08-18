@@ -26,8 +26,9 @@ from electrum.gui.qt.util import (
 
 from .swapserver_gui import (
     SwapServerGuiPlugin, SwapServerError, AnnounceState, ComponentKind,
-    ServedSwapRow, SwapComponent, build_served_swap_rows, format_batched_note,
-    format_summary_line, get_swap_summary, save_settings,
+    ServedSwapRow, SwapComponent, SwapRole, build_served_swap_rows,
+    format_batched_note, format_incomplete_note, format_summary_line,
+    format_unattributed_note, get_swap_summary, save_settings,
 )
 # NB: not ``from . import pow as swap_pow`` -- that form breaks when Electrum
 # loads this plugin from a zip.  See the long comment in swapserver_gui.py.
@@ -231,7 +232,10 @@ class SwapComponentsDialog(QDialog):
             else _("reverse swap (the taker paid lightning, we sent on-chain)")
         form.addRow(_("Type:"), self._value_label(kind))
         form.addRow(_("Date:"), self._value_label(row.date))
-        form.addRow(_("Net return:"), self._value_label(_fmt_sat(self.config, row.return_sat)))
+        # An incomplete row has no return to show: see format_incomplete_note.
+        return_text = _("not known — incomplete") if row.return_sat is None \
+            else _fmt_sat(self.config, row.return_sat)
+        form.addRow(_("Net return:"), self._value_label(return_text))
         form.addRow(_("On-chain amount:"),
                     self._value_label(_fmt_sat(self.config, row.onchain_amount_sat)))
         form.addRow(_("Lightning amount:"),
@@ -240,6 +244,10 @@ class SwapComponentsDialog(QDialog):
         form.addRow(_("Lockup address:"), self._value_label(row.lockup_address))
         form.addRow(_("Refund locktime:"), self._value_label(
             _("block {}").format(row.locktime) if row.locktime else "—"))
+        if row.missing_legs:
+            form.addRow(WWLabel(format_incomplete_note(missing_legs=row.missing_legs)))
+        if row.role is SwapRole.UNKNOWN:
+            form.addRow(WWLabel(format_unattributed_note()))
         if row.batched_with:
             note = WWLabel(format_batched_note(batched_with=row.batched_with))
             form.addRow(note)
@@ -259,6 +267,10 @@ class SwapComponentsDialog(QDialog):
                 else _fmt_sat(self.config, component.value_sat)
             if component.in_wallet:
                 location = _("in this wallet's history")
+            elif component.is_missing:
+                # Ours, and absent: this is the leg that makes the row
+                # incomplete, so it has to read differently from the taker's.
+                location = _("missing from this wallet")
             elif component.txid:
                 location = _("made by the taker")
             else:
@@ -283,6 +295,11 @@ class SwapComponentsDialog(QDialog):
     def on_component_activated(self, item: QTreeWidgetItem, column: int) -> None:
         component = item.data(self.COL_COMPONENT, Qt.ItemDataRole.UserRole)
         if component is None:
+            return
+        if component.is_missing:
+            self._say(_("{name} is this wallet's own leg, but it is not in its "
+                        "history, so there is nothing to jump to. This is why "
+                        "the swap shows no return.").format(name=component.title))
             return
         if not component.in_wallet:
             self._say(_("{name} was made by the taker, so it is not in this "
@@ -984,13 +1001,24 @@ class SwapServerTab(QWidget):
             net_return=_fmt_sat(self.config, summary["overall_return_sat"]),
             swaps_per_day=summary["swaps_per_day"],
             num_batched=summary["num_batched"],
+            num_incomplete=summary["num_incomplete"],
+            num_unattributed=summary["num_unattributed"],
         ))
         self.history_tree.clear()
         for row in reversed(rows):  # newest first
-            tree_item = QTreeWidgetItem([row.date, row.label, str(row.return_sat)])
+            # A row with a leg missing has no return to print. Showing the
+            # partial sum instead would read as a real (and often negative)
+            # result, which is exactly the reading this avoids.
+            return_text = _("— incomplete") if row.return_sat is None \
+                else str(row.return_sat)
+            tree_item = QTreeWidgetItem([row.date, row.label, return_text])
             tree_item.setData(0, Qt.ItemDataRole.UserRole, row)
             tip = _("{n} component(s); double-click for details.").format(
                 n=len(row.components))
+            if row.missing_legs:
+                tip += "\n\n" + format_incomplete_note(missing_legs=row.missing_legs)
+            if row.role is SwapRole.UNKNOWN:
+                tip += "\n\n" + format_unattributed_note()
             if row.batched_with:
                 # Unlike before, the value *is* this swap's own -- the shared
                 # transaction's fee is split across the swaps that caused it --
@@ -999,6 +1027,10 @@ class SwapServerTab(QWidget):
                 tip += "\n\n" + format_batched_note(batched_with=row.batched_with)
             for col in range(3):
                 tree_item.setToolTip(col, tip)
+            if not row.counts_towards_total:
+                # Dimmed for the same reason the number is withheld: this row
+                # is not part of the total printed above it.
+                tree_item.setForeground(2, ColorScheme.GRAY.as_color())
             self.history_tree.addTopLevelItem(tree_item)
 
     def on_history_row_activated(self, item: QTreeWidgetItem, column: int) -> None:

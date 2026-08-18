@@ -270,12 +270,43 @@ Two mechanisms replace that guess, in order of authority:
    transport funnel into — and records each payment hash under the wallet-db key
    `swapserver_gui_served_swaps`. Exact, for every swap created since this
    version was installed.
-2. **A field heuristic** (`looks_server_side`) for older swaps, keyed on the
-   asymmetric mining-fee prepayment: a server's normal swap always carries a
-   `prepay_hash` (`create_normal_swap` hardcodes `prepay=True`) while our own
-   forward swap never does (`request_normal_swap` passes `prepay=False`), and the
-   reverse pair mirrors it. The e2e test asserts this table against the objects
-   upstream actually builds, so it cannot drift silently.
+2. **Fields only one side writes**, for older swaps. A server's normal swap
+   always carries a `prepay_hash` (`create_normal_swap` hardcodes `prepay=True`)
+   while our own forward swap never does (`request_normal_swap` passes
+   `prepay=False`); `claim_to_output` is set by the customer alone. That names
+   three of the four ways a swap reaches the wallet.
+3. **The sign of the margin** (`swap_margin_sat`), for the fourth. Our own
+   reverse swap against a server that sent no `minerFeeInvoice` records exactly
+   what our own server records for a forward swap it serves — same
+   `is_reverse`, no `prepay_hash`, no `claim_to_output`. The amounts still tell
+   them apart, because the server is by construction the side that comes out
+   ahead: `_get_send_amount` adds `percentage_fee + mining_fee` and
+   `_get_recv_amount` subtracts them, and each is used in one direction only. So
+   `onchain_amount > lightning_amount` on a swap we claim (and the reverse on
+   one we fund) means we were the server. Without this, a reverse swap you *paid
+   for* lands in the served table with its cost reported as a negative return.
+
+When even the margin is silent — a server charging neither a percentage nor a
+mining fee — the swap is reported as **unattributed** rather than guessed at: it
+stays visible, and stays out of the net return.
+
+The e2e test asserts this table against the objects upstream actually builds, so
+it cannot drift silently.
+
+### A note on returns that are not shown
+
+A leg of a swap that is yours but is **not in the wallet's history** has an
+unknown value, not a zero one. It happens: the taker never paid the hold
+invoice, or the channel that carried the payment is gone (`get_lightning_history`
+walks the wallet's *current* channels). Adding up the remaining legs then
+produces a number that reads as a result and is not one — a served reverse swap
+missing its prepayment reads as a loss it never made, and a claim transaction
+with no lightning payment behind it reads as revenue it never earned.
+
+Such a row shows `— incomplete` instead of a figure, names the legs it is short
+of in its tooltip and detail window, and is left out of the net return, which
+says how many rows it excluded. The leg the *counterparty* made is a different
+thing entirely: it is absent by design, and does not make a row incomplete.
 
 ### A note on one row per swap
 
@@ -317,15 +348,25 @@ and rewrites the group labels to say the role out loud:
 |---|---|
 | `⇄ Served forward swap 0.2 mBTC` | provided by your server to someone else |
 | `↪ My forward swap 0.1 mBTC` | initiated by you as a customer |
+| `⇄? Unattributed forward swap 0.2 mBTC` | the records do not say which |
 
 Wrapping is necessary rather than tidy: that method both builds the mapping and
 re-applies the labels it carries on every history refresh, so a label written
 once would be overwritten within seconds. The per-leg labels ("Funding
-transaction", "Claim transaction") are left alone — they are the component
-names, and the component window uses the same ones. The leading word is what
-the History tab's search box filters on, and it survives CSV export. The wrapper
-is installed for as long as a wallet is bound, not just while the server runs,
-and is removed when the wallet closes or the plugin is disabled.
+transaction", "Claim transaction") are normally left alone — they are the
+component names, and the component window uses the same ones. The leading word
+is what the History tab's search box filters on, and it survives CSV export. The
+wrapper is installed for as long as a wallet is bound, not just while the server
+runs, and is removed when the wallet closes or the plugin is disabled.
+
+There is one case where the leg label has to be rewritten too. A group with a
+single member never survives to be expanded — `get_full_history` replaces it by
+that member, which is displayed under the **leg** label, so the group label (and
+with it everything the wrapper does) never reaches the screen. A swap whose
+lightning payment is missing from the wallet has only its on-chain leg, and so
+appears in the History tab as a bare "Claim transaction" belonging to no visible
+swap. When a group is going to collapse, the wrapper names the leg after the
+swap instead.
 
 ### A note on the HTTP port
 
