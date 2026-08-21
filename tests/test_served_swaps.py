@@ -47,9 +47,9 @@ from swapserver_gui.swapserver_gui import (  # noqa: E402
     served_swaps_ledger, swap_margin_sat,
 )
 from swapserver_gui.served_swaps import (  # noqa: E402
-    FUNDING_OUTPUT_VBYTES, build_swap_rows, claim_input_vbytes, flatten_history,
-    format_local_note, format_swap_status, split_fee, swap_status,
-    taker_did_forward_swap,
+    FUNDING_OUTPUT_VBYTES, OWN_LABEL_MARK, SERVED_LABEL_MARK, build_swap_rows,
+    claim_input_vbytes, flatten_history, relabel_swap_history_items, split_fee,
+    swap_status, taker_did_forward_swap,
 )
 
 
@@ -524,6 +524,146 @@ class SwapLabelTests(unittest.TestCase):
         self.assertNotIn("My ", label)
 
 
+class RelabelHistoryItemsTests(unittest.TestCase):
+    """Rewriting swap labels in one copy of ``get_full_history``'s output.
+
+    This is what the "History (Swaps)" tab renders.  Two things are under test
+    throughout: that the rows say which side of the swap this wallet was on,
+    and that nothing is written to the wallet -- because the wallet is what
+    Electrum's own History tab reads, and that tab has to stay upstream's.
+    """
+
+    def _wallet(self, swaps: Dict[str, _Swap]) -> Any:
+        wallet = _make_wallet(swaps)
+        # MagicMock answers every call with a truthy Mock; both of these read as
+        # data in the code under test ("the operator labelled this", "here is
+        # the formatted amount"), so they have to be pinned rather than left to
+        # auto-speccing.
+        wallet._get_label.return_value = ''
+        wallet.lnworker.swap_manager.config.format_amount_and_units.side_effect = \
+            lambda sat: f"{sat} sat"
+        return wallet
+
+    @staticmethod
+    def _group(group_id: str, label: str, *children: Dict[str, Any]) -> Dict[str, Any]:
+        """A history group, keyed the way ``get_full_history`` keys one."""
+        return {'group:' + group_id: {
+            'txid': '----', 'label': label, 'lightning': False,
+            'value': _Value(0), 'children': list(children),
+        }}
+
+    def test_a_served_forward_swap_stops_reading_reverse_swap(self) -> None:
+        """The row upstream names after *our* copy's is_reverse flag."""
+        swap = _served_forward_swap(funding_txid='tx_f', spending_txid='tx_claim')
+        wallet = self._wallet({'ab' * 32: swap})
+        # is_reverse is True on our copy, so this is upstream's label for it.
+        history = self._group('tx_claim', 'Reverse swap 100000 sat',
+                              _onchain('tx_claim', 99_800))
+        relabel_swap_history_items(wallet, history)
+        label = history['group:tx_claim']['label']
+        self.assertIn(SERVED_LABEL_MARK, label)
+        self.assertIn("Served forward swap", label)
+        self.assertNotIn("Reverse swap", label)
+
+    def test_the_operators_own_swap_reads_as_theirs(self) -> None:
+        swap = _own_forward_swap(funding_txid='tx_own', spending_txid='tx_own_claim')
+        wallet = self._wallet({'cd' * 32: swap})
+        history = self._group('tx_own', 'Forward swap 100000 sat',
+                              _onchain('tx_own', -100_000))
+        relabel_swap_history_items(wallet, history)
+        label = history['group:tx_own']['label']
+        self.assertIn(OWN_LABEL_MARK, label)
+        self.assertIn("My", label)
+
+    def test_an_unattributable_swap_says_so_rather_than_guessing(self) -> None:
+        # Fields identical on both sides and no margin to break the tie.
+        swap = _Swap(is_reverse=True, onchain_amount=100_000,
+                     lightning_amount=100_000, funding_txid='tx_f',
+                     spending_txid='tx_claim')
+        wallet = self._wallet({'ef' * 32: swap})
+        history = self._group('tx_claim', 'Reverse swap 100000 sat',
+                              _onchain('tx_claim', 99_800))
+        relabel_swap_history_items(wallet, history)
+        self.assertIn("Unattributed", history['group:tx_claim']['label'])
+
+    def test_the_legs_inside_a_group_keep_their_own_names(self) -> None:
+        """The group is the swap; its children are the components."""
+        swap = _served_forward_swap(funding_txid='tx_f', spending_txid='tx_claim')
+        wallet = self._wallet({'ab' * 32: swap})
+        history = self._group('tx_claim', 'Reverse swap 100000 sat',
+                              dict(_onchain('tx_claim', 99_800),
+                                   label='Claim transaction'),
+                              dict(_ln('ab' * 32, -99_000), label=''))
+        relabel_swap_history_items(wallet, history)
+        children = history['group:tx_claim']['children']
+        self.assertEqual(children[0]['label'], 'Claim transaction')
+
+    def test_a_group_of_one_is_relabelled_where_it_is_actually_shown(self) -> None:
+        """``get_full_history`` replaces a single-member group by the member.
+
+        The group label then never reaches the screen, so a swap whose
+        lightning leg is missing would keep reading "Claim transaction" -- with
+        no swap row anywhere -- unless the leg row itself is rewritten.
+        """
+        swap = _served_forward_swap(funding_txid='tx_f', spending_txid='tx_claim')
+        wallet = self._wallet({'ab' * 32: swap})
+        collapsed = dict(_onchain('tx_claim', 99_800), label='Claim transaction')
+        history = {'group:tx_claim': collapsed}  # no 'children': collapsed
+        relabel_swap_history_items(wallet, history)
+        self.assertIn("Served forward swap", history['group:tx_claim']['label'])
+
+    def test_a_label_the_operator_typed_wins_on_a_collapsed_group(self) -> None:
+        """Same precedence as everywhere else in Electrum: the user's label."""
+        swap = _served_forward_swap(funding_txid='tx_f', spending_txid='tx_claim')
+        wallet = self._wallet({'ab' * 32: swap})
+        wallet._get_label.side_effect = \
+            lambda key: 'my note about this one' if key == 'tx_claim' else ''
+        collapsed = dict(_onchain('tx_claim', 99_800), label='my note about this one')
+        history = {'group:tx_claim': collapsed}
+        relabel_swap_history_items(wallet, history)
+        self.assertEqual(history['group:tx_claim']['label'], 'my note about this one')
+
+    def test_an_ungrouped_transaction_is_still_found(self) -> None:
+        swap = _served_forward_swap(funding_txid='tx_f', spending_txid='tx_claim')
+        wallet = self._wallet({'ab' * 32: swap})
+        history = {'tx_claim': dict(_onchain('tx_claim', 99_800), label='')}
+        relabel_swap_history_items(wallet, history)
+        self.assertIn("Served forward swap", history['tx_claim']['label'])
+
+    def test_nothing_is_written_to_the_wallet(self) -> None:
+        """The whole point: Electrum's History tab reads the wallet's labels."""
+        swap = _served_forward_swap(funding_txid='tx_f', spending_txid='tx_claim')
+        wallet = self._wallet({'ab' * 32: swap})
+        history = self._group('tx_claim', 'Reverse swap 100000 sat',
+                              _onchain('tx_claim', 99_800))
+        relabel_swap_history_items(wallet, history)
+        wallet.set_group_label.assert_not_called()
+        wallet.set_default_label.assert_not_called()
+        wallet.set_label.assert_not_called()
+
+    def test_a_swap_with_no_transaction_of_ours_is_skipped(self) -> None:
+        swap = _served_forward_swap(funding_txid=None, spending_txid=None)
+        wallet = self._wallet({'ab' * 32: swap})
+        history = {'tx_other': dict(_onchain('tx_other', 1), label='coffee')}
+        relabel_swap_history_items(wallet, history)
+        self.assertEqual(history['tx_other']['label'], 'coffee')
+
+    def test_a_swap_missing_from_the_history_changes_nothing(self) -> None:
+        swap = _served_forward_swap(funding_txid='tx_f', spending_txid='tx_gone')
+        wallet = self._wallet({'ab' * 32: swap})
+        history = {'tx_other': dict(_onchain('tx_other', 1), label='coffee')}
+        out = relabel_swap_history_items(wallet, history)
+        self.assertIs(out, history)  # mutated in place, and returned
+        self.assertEqual(history['tx_other']['label'], 'coffee')
+
+    def test_a_wallet_without_a_swap_manager_is_not_an_error(self) -> None:
+        wallet = mock.MagicMock()
+        wallet.lnworker = None
+        history = {'tx1': {'label': 'coffee'}}
+        self.assertIs(relabel_swap_history_items(wallet, history), history)
+        self.assertEqual(history['tx1']['label'], 'coffee')
+
+
 class SummaryLineTests(unittest.TestCase):
     """The strings the operator reads; pure, so testable without PyQt6."""
 
@@ -922,12 +1062,6 @@ class SwapStatusTests(unittest.TestCase):
         wallet.adb.get_tx_height.side_effect = RuntimeError("no chain")
         self.assertIs(swap_status(wallet, swap), SwapStatus.IN_FLIGHT)
 
-    def test_every_status_has_a_name(self) -> None:
-        for status in SwapStatus:
-            with self.subTest(status=status):
-                self.assertTrue(format_swap_status(status))
-                self.assertNotIn('SwapStatus', format_swap_status(status))
-
 
 class PendingRowTests(unittest.TestCase):
     """What the Swaps history tab adds, and what the Swap Server tab must not."""
@@ -1037,11 +1171,6 @@ class PendingRowTests(unittest.TestCase):
         self.assertNotIn("Swaps served:", text)
         self.assertIn("17", text)
         self.assertIn("served and own", text)
-
-    def test_the_local_note_explains_the_stranded_batch(self) -> None:
-        note = format_local_note()
-        self.assertIn("never broadcast", note)
-        self.assertIn("left out of the net return", note)
 
 
 if __name__ == "__main__":

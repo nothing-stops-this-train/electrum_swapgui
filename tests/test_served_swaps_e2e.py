@@ -19,6 +19,7 @@ Run with:  python3 -m pytest tests/test_served_swaps_e2e.py
 """
 import asyncio
 import datetime
+import hashlib
 import json
 import os
 import socket
@@ -49,7 +50,10 @@ from swapserver_gui.swapserver_gui import (  # noqa: E402
     served_swaps_ledger,
 )
 from swapserver_gui.served_swaps import (  # noqa: E402
-    OWN_LABEL_MARK, SERVED_LABEL_MARK,
+    OWN_LABEL_MARK, SERVED_LABEL_MARK, relabel_swap_history_items,
+)
+from swapserver_gui.history_export import (  # noqa: E402
+    build_history_export, encode_history_export,
 )
 
 THEIR_PUBKEY = bytes.fromhex('02' + '11' * 32)  # the taker's key, we only embed it
@@ -413,6 +417,119 @@ class ServedSwapsE2ETest(unittest.TestCase):
                                  f"{txid}.{key} was rewritten")
                 self.assertNotIn(OWN_LABEL_MARK, entry.get(key) or '',
                                  f"{txid}.{key} was rewritten")
+
+    def test_the_swaps_tab_names_the_side_we_were_on(self) -> None:
+        """The relabel that the "History (Swaps)" tab renders, end to end.
+
+        Real ``SwapData`` objects created over the wire, upstream's real group
+        builder, and a history dict shaped the way ``get_full_history`` shapes
+        one -- group row, children underneath.  Only the copy handed to the
+        relabeller changes.
+        """
+        self._start_server()
+        served_forward = self._serve_taker_forward_swap()
+        own_reverse = self._own_reverse_swap()
+        self._confirm(served_forward, funding='tx_f', spending='tx_claim')
+        self._confirm(own_reverse, funding='tx_own_f', spending='tx_own_claim')
+        self.wallet._get_label.return_value = ''  # nothing labelled by hand
+
+        served_swap = self.sm._swaps[served_forward]
+        own_swap = self.sm._swaps[own_reverse]
+        # Upstream keys a swap's group on the transaction of ours it is
+        # anchored to: the spending tx for a swap our copy calls reverse.
+        history = {
+            'group:tx_claim': {
+                'txid': '----', 'label': 'Reverse swap 300000 sat',
+                'lightning': False, 'value': _Value(299_800),
+                'children': [
+                    dict(_onchain('tx_claim', 299_800, fee=200, ts=1_700_000_000),
+                         label='Claim transaction'),
+                    dict(_ln(served_forward, -299_000, ts=1_700_000_000), label=''),
+                ],
+            },
+            'group:tx_own_claim': {
+                'txid': '----', 'label': 'Reverse swap 150000 sat',
+                'lightning': False, 'value': _Value(148_000),
+                'children': [
+                    dict(_onchain('tx_own_claim', 148_000, fee=200, ts=1_700_000_100),
+                         label='Claim transaction'),
+                    dict(_ln(own_reverse, -150_000, ts=1_700_000_100), label=''),
+                ],
+            },
+            'tx_coffee': dict(_onchain('tx_coffee', -5_000, fee=100,
+                                       ts=1_700_000_200), label='coffee'),
+        }
+        relabel_swap_history_items(self.wallet, history, sm=self.sm)
+
+        # The swap we served for a taker's *forward* swap: upstream calls it a
+        # reverse swap, after our copy's is_reverse flag.
+        served_label = history['group:tx_claim']['label']
+        self.assertIn(SERVED_LABEL_MARK, served_label)
+        self.assertIn('Served forward swap', served_label)
+        self.assertIn(str(served_swap.lightning_amount), served_label)
+        # ...and one of ours reads as ours.
+        own_label = history['group:tx_own_claim']['label']
+        self.assertIn(OWN_LABEL_MARK, own_label)
+        self.assertIn('My reverse swap', own_label)
+        self.assertIn(str(own_swap.lightning_amount), own_label)
+        # The legs keep their names, and a row that is not a swap is untouched.
+        self.assertEqual(
+            history['group:tx_claim']['children'][0]['label'], 'Claim transaction')
+        self.assertEqual(history['tx_coffee']['label'], 'coffee')
+
+        # Electrum's own History tab still reads exactly as upstream built it,
+        # after the relabel as well as before it: nothing was written back.
+        self.wallet.lnworker.lnwatcher.adb.get_transaction.return_value = None
+        groups = self.sm.get_groups_for_onchain_history()
+        self.assertIn('Reverse swap', groups['tx_claim']['group_label'])
+        self.assertEqual(groups['tx_claim']['label'], 'Claim transaction')
+        self.wallet.set_group_label.assert_not_called()
+        self.wallet.set_default_label.assert_not_called()
+
+    def test_the_diagnostics_export_carries_the_real_swaps_and_no_secrets(self) -> None:
+        """The export, against real ``SwapData`` with real keys in it.
+
+        The privkey and the preimage here are the ones the server actually
+        generated for a swap it served, which is what makes this the test that
+        matters: a diagnostics file gets sent to other people.
+        """
+        self._start_server()
+        served = self._serve_taker_reverse_swap()
+        own = self._own_forward_swap()
+        self._confirm(served, funding='tx_served_funding', spending='tx_served_claim')
+        self._confirm(own, funding='tx_own_funding', spending='tx_own_claim')
+        swap = self.sm._swaps[served]
+        prepay_sat = 2 * self.sm.mining_fee
+        self.wallet.get_full_history.return_value = _history(
+            _onchain('tx_served_funding', -swap.onchain_amount - 300, fee=300,
+                     ts=1_700_000_000),
+            _ln(served, swap.lightning_amount - prepay_sat, ts=1_700_000_000),
+            _ln(swap.prepay_hash.hex(), prepay_sat, ts=1_700_000_000),
+        )
+        # A real (empty) transaction store, rather than the MagicMock's.
+        self.wallet.adb.db = self.db
+
+        data = build_history_export(self.wallet, plugin_status=self.plugin.status())
+        by_hash = {record['payment_hash']: record for record in data['swaps']}
+        self.assertEqual(set(by_hash), {served, own})
+        self.assertEqual(by_hash[served]['role'], 'served')
+        self.assertEqual(by_hash[own]['role'], 'own')
+        self.assertEqual(by_hash[served]['lockup_address'], swap.lockup_address)
+        self.assertEqual(by_hash[served]['funding_txid'], 'tx_served_funding')
+        # The ledger the classification rests on travels with them.
+        self.assertEqual(list(data['served_swaps_ledger']['entries']), [served])
+        # ...as does this plugin's own reading of the same swaps.
+        self.assertIn(served, [row['payment_hash'] for row in data['swap_rows']])
+        self.assertTrue(data['server']['running'])
+
+        text = encode_history_export(data)
+        json.loads(text)  # it really is json
+        for secret in (swap.privkey, swap.preimage):
+            if secret:
+                self.assertNotIn(secret.hex(), text, "a swap secret reached the file")
+        self.assertEqual(
+            by_hash[served]['privkey_sha256'],
+            hashlib.sha256(swap.privkey).hexdigest()[:16])
 
     def test_an_unbroadcast_batch_is_reported_as_local_not_as_served(self) -> None:
         """The stranded-batch case, end to end.

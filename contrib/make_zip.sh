@@ -10,6 +10,7 @@
 #     swapserver_gui/__init__.py
 #     swapserver_gui/swapserver_gui.py
 #     swapserver_gui/served_swaps.py
+#     swapserver_gui/history_export.py
 #     swapserver_gui/pow.py
 #     swapserver_gui/nostr_check.py
 #     swapserver_gui/qt.py

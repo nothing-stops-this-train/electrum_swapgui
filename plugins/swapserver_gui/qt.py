@@ -6,31 +6,36 @@
 # Qt layer: injects a "Swap Server" tab into the main window and wires its
 # controls to the transport lifecycle implemented in ``swapserver_gui.py``.
 
+import functools
 import importlib
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
 import time
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QModelIndex
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QGroupBox,
     QLabel, QPushButton, QSpinBox, QPlainTextEdit, QTreeWidget, QTreeWidgetItem,
-    QSizePolicy, QTabWidget, QAbstractItemView, QDialog,
+    QSizePolicy, QTabWidget, QAbstractItemView, QDialog, QCheckBox,
+    QScrollArea, QFrame,
 )
 from PyQt6.QtCore import QItemSelectionModel
 
 from electrum.i18n import _
 from electrum.plugin import hook
+from electrum.gui.qt.history_list import HistoryList, HistoryModel
 from electrum.gui.qt.util import (
     read_QIcon, pubkey_to_q_icon, WWLabel, ColorScheme, Buttons, CloseButton,
+    getSaveFileName,
 )
 
 from .swapserver_gui import (
-    SwapServerGuiPlugin, SwapServerError, AnnounceState, ComponentKind,
-    ServedSwapRow, SwapComponent, SwapRole, SwapStatus, build_served_swap_rows,
-    build_swap_rows, format_batched_note, format_incomplete_note,
-    format_local_note, format_summary_line, format_swap_status,
-    format_unattributed_note, get_swap_summary, save_settings,
+    SwapServerGuiPlugin, SwapServerError, AnnounceState, ServedSwapRow,
+    SwapRole, build_served_swap_rows, format_batched_note,
+    format_incomplete_note, format_summary_line, format_unattributed_note,
+    get_swap_summary, relabel_swap_history_items, save_settings,
 )
+history_export = importlib.import_module('.history_export', __package__)
 # NB: not ``from . import pow as swap_pow`` -- that form breaks when Electrum
 # loads this plugin from a zip.  See the long comment in swapserver_gui.py.
 swap_pow = importlib.import_module('.pow', __package__)
@@ -193,8 +198,7 @@ class SwapComponentsDialog(QDialog):
     #: Column indexes of the component tree.
     COL_COMPONENT, COL_AMOUNT, COL_LOCATION = range(3)
 
-    def __init__(self, tab: Union['SwapServerTab', 'SwapHistoryTab'],
-                 row: 'ServedSwapRow') -> None:
+    def __init__(self, tab: 'SwapServerTab', row: 'ServedSwapRow') -> None:
         QDialog.__init__(self, tab)
         self.setWindowTitle(_("Swap details"))
         self.setWindowModality(Qt.WindowModality.NonModal)
@@ -609,7 +613,118 @@ class SwapServerTab(QWidget):
         check_layout.addWidget(self.check_warnings)
         outer.addWidget(check_box, 1)
 
-        return page
+        outer.addWidget(self._build_export_group())
+
+        # Scrolled, because this pane is the tall one and the window it lives
+        # in is not necessarily tall: without this the last group is squeezed
+        # below its own minimum and its wrapped text is clipped rather than
+        # merely made narrower.
+        area = QScrollArea()
+        area.setWidget(page)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        return area
+
+    def _build_export_group(self) -> QGroupBox:
+        """The whole transaction history, in a file someone can be sent.
+
+        Not the same thing as the History tab's own Export, which drops every
+        entry with no timestamp -- so the unconfirmed transactions, and the
+        local ones a stranded swap batch leaves behind, are exactly what it
+        leaves out.  See ``history_export.py``.
+        """
+        box = QGroupBox(_("Export"))
+        layout = QVBoxLayout(box)
+
+        # Kept to two lines: this pane is the short one, and a paragraph here
+        # is the first thing to be clipped.  The detail is on the button.
+        blurb = WWLabel(_(
+            "Write the complete transaction history to a json file, including "
+            "the unconfirmed and local (never broadcast) transactions "
+            "Electrum's own export leaves out."))
+        layout.addWidget(blurb)
+        privacy = WWLabel(_(
+            "Swap keys and preimages are not exported; your addresses, labels "
+            "and transactions are. Treat the file as private."))
+        privacy.setEnabled(False)  # renders dimmed, like secondary text
+        layout.addWidget(privacy)
+
+        self.export_raw_cb = QCheckBox(
+            _("Include the raw hex of confirmed transactions"))
+        self.export_raw_cb.setToolTip(_(
+            "Unconfirmed and local transactions always carry their raw hex, "
+            "because nothing else has a copy of them.\nConfirmed ones can be "
+            "fetched from any block explorer, so their hex is left out unless "
+            "asked for; it makes the file several times larger."))
+        layout.addWidget(self.export_raw_cb)
+
+        row = QHBoxLayout()
+        self.export_btn = QPushButton(_("Export transaction history…"))
+        self.export_btn.setToolTip(_(
+            "Writes one json file containing:\n"
+            "  • every history entry, groups and children intact, with nothing "
+            "filtered out for having no timestamp\n"
+            "  • every transaction this wallet holds: height, confirmations, "
+            "inputs, outputs, and whether it is local\n"
+            "  • the swap records, this plugin's reading of them, the "
+            "lightning payments and channels\n"
+            "  • the labels, yours and the generated ones\n"
+            "  • this server's announcement state at the moment of export"))
+        self.export_btn.clicked.connect(self.on_export_history)
+        row.addWidget(self.export_btn)
+        self.export_result = QLabel("")
+        self.export_result.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(self.export_result, 1)
+        layout.addLayout(row)
+
+        return box
+
+    def on_export_history(self) -> None:
+        """Ask where to put the diagnostics file, then write it there."""
+        default_name = "electrum-swapgui-diagnostics-{wallet}-{stamp}.json".format(
+            wallet=(self.wallet.basename() if self.wallet is not None else "wallet"),
+            stamp=time.strftime("%Y%m%d-%H%M%S"))
+        path = getSaveFileName(
+            parent=self,
+            title=_("Export transaction history for debugging"),
+            filename=default_name,
+            filter="JSON (*.json);;All files (*)",
+            default_extension="json",
+            default_filter="JSON (*.json)",
+            config=self.config,
+        )
+        if not path:
+            return
+        try:
+            summary = history_export.write_history_export(
+                self.wallet, path,
+                plugin_status=self.plugin.status(),
+                include_raw_confirmed=self.export_raw_cb.isChecked(),
+            )
+        except Exception as e:
+            # Including the failures history_export declines to swallow: it
+            # gives up a field rather than the file, so what reaches here is
+            # the file itself not being writable.
+            self.plugin.logger.warning("history export failed", exc_info=True)
+            self.export_result.setText(_("Export failed."))
+            self.window.show_critical(str(e), title=_("Could not export history"))
+            return
+        # Say what actually went into it: an export that quietly found nothing
+        # otherwise looks exactly like one that worked.
+        self.export_result.setText(_(
+            "{size} kB — {txs} transaction(s), {local} local, {swaps} swap(s)").format(
+                size=max(1, round(summary["bytes"] / 1000)),
+                txs=summary["num_transactions"],
+                local=summary["num_local_transactions"],
+                swaps=summary["num_swaps"]))
+        self.export_result.setToolTip(summary["path"])
+        self.window.show_message(
+            _("Wrote {n} history entries, {t} transactions and {s} swap records "
+              "to:\n{path}").format(
+                  n=summary["num_history_entries"], t=summary["num_transactions"],
+                  s=summary["num_swaps"], path=summary["path"]),
+            title=_("History exported"))
 
     # ------------------------------------------------------------- settings
     def load_settings_into_widgets(self) -> None:
@@ -1051,34 +1166,102 @@ class SwapServerTab(QWidget):
         dialog.activateWindow()
 
 
-class SwapHistoryTab(QWidget):
-    """The "History (Swaps)" tab: the wallet's history, reorganised per swap.
+# ---------------------------------------------------------------------------
+# The "History (Swaps)" tab
+#
+# This tab is Electrum's History tab, built from the same model and the same
+# view class, with one difference: the swap rows in *this copy* say which side
+# of each swap this wallet was on.
+#
+# The plugin used to write those labels into the wallet, by wrapping
+# ``SwapManager.get_groups_for_onchain_history`` -- whose labels
+# ``LNWallet.get_groups_for_onchain_history`` then puts into
+# ``wallet._default_labels`` -- so they appeared in Electrum's own History tab.
+# That is the one thing this must not do: the History tab has to keep looking
+# the way upstream renders it.  So the rewrite happens on the *result* of
+# ``wallet.get_full_history``, for the duration of this model's refresh only,
+# and nothing is written to the wallet at all.
+# ---------------------------------------------------------------------------
 
-    Electrum's History tab is transaction-shaped, and a swap is not a
-    transaction: it is a lightning payment, sometimes a mining-fee prepayment,
-    a funding transaction and a claim or refund transaction, which the history
-    scatters across a group -- or collapses into a single leg, or merges with
-    another swap that shared a batch transaction.  This tab is the same history
-    keyed on the swap instead: one top-level row per swap, its components
-    underneath it, and a value that is that swap's own.
+@contextmanager
+def swap_labels_for(wallet: 'Abstract_Wallet', logger: Any = None) -> Iterator[None]:
+    """Shadow ``wallet.get_full_history`` so its result carries swap labels.
 
-    It exists *instead of* rewriting rows in Electrum's History tab, which this
-    plugin used to do by wrapping
-    ``SwapManager.get_groups_for_onchain_history``.  That tab is now left
-    exactly as upstream renders it; nothing here writes to the wallet.
+    Instance-level, and undone in a ``finally``, so the class method upstream
+    calls everywhere else -- including for Electrum's own History tab, which
+    refreshes from the same wallet -- is untouched.  The GUI is single
+    threaded, and both models refresh on the GUI thread, so no other reader can
+    observe the shadow while it is up.
+    """
+    name = 'get_full_history'
+    original = getattr(wallet, name)
+    shadowed = wallet.__dict__.get(name)  # captured before we overwrite it
 
-    Unlike the Swap Server tab's table, this one lists the operator's own swaps
-    as well as the served ones, and swaps that have not settled as well as
-    those that have -- because a swap the operator can see in the History tab
-    should never be missing from the swap-shaped view of that same history.
-    Only served, settled, complete swaps contribute to the net return; see
-    :attr:`ServedSwapRow.counts_towards_total`.
+    @functools.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        transactions = original(*args, **kwargs)
+        try:
+            return relabel_swap_history_items(wallet, transactions)
+        except Exception:
+            # The history must render even if a swap cannot be classified;
+            # upstream's labels are a perfectly good fallback.
+            if logger is not None:
+                logger.warning("could not relabel swap history", exc_info=True)
+            return transactions
+
+    setattr(wallet, name, wrapper)
+    try:
+        yield
+    finally:
+        if shadowed is None:
+            wallet.__dict__.pop(name, None)  # expose the class method again
+        else:
+            setattr(wallet, name, shadowed)
+
+
+class SwapHistoryModel(HistoryModel):
+    """Electrum's history model, reading a swap-labelled history.
+
+    Everything else -- columns, grouping, fiat, sorting, the context menu the
+    view builds from it -- is upstream's, so this tab keeps working like the
+    History tab it is a copy of.
     """
 
-    #: Column indexes of the swap tree.
-    COL_DATE, COL_STATUS, COL_LABEL, COL_RETURN = range(4)
+    def __init__(self, plugin: 'Plugin', window: 'ElectrumWindow') -> None:
+        HistoryModel.__init__(self, window)
+        self.plugin = plugin
 
-    #: How often the table is rebuilt, in ms.  Matches the Swap Server tab.
+    def refresh(self, reason: str) -> None:
+        # Asked first, and not only by upstream's refresh: it is what makes a
+        # periodic refresh free while the tab is not on screen, and it leaves
+        # the "stale, redraw on show" flag that MyTreeView.showEvent acts on.
+        if self.view is None or self.view.maybe_defer_update():
+            return
+        with swap_labels_for(self.window.wallet, self.plugin.logger):
+            HistoryModel.refresh(self, reason)
+
+
+class SwapHistoryTab(QWidget):
+    """The "History (Swaps)" tab: the wallet's history, named by swap role.
+
+    Upstream names a swap after ``SwapData.is_reverse``, which is stored from
+    the point of view of whoever stored it -- so a forward swap this server
+    provided reads "Reverse swap" in the history, and a swap the operator made
+    themselves reads exactly like one they served.  Here they read "Served
+    forward swap" and "My reverse swap"; see
+    :func:`served_swaps.format_swap_label`.
+
+    Deliberately the same widget as the History tab, rather than a table of
+    this plugin's own: everything the operator already knows how to do there --
+    the date filter, the summary, Export, the right-click menu, editing a
+    description, double-clicking for the transaction dialog -- keeps working,
+    because it is the same view class driving the same model class against the
+    same wallet.
+    """
+
+    #: How often the history is rebuilt, in ms.  Matches the Swap Server tab.
+    #: Refreshes while the tab is off screen cost nothing; see
+    #: :meth:`SwapHistoryModel.refresh`.
     REFRESH_MS = 4000
 
     def __init__(self, plugin: 'Plugin', window: 'ElectrumWindow') -> None:
@@ -1087,176 +1270,46 @@ class SwapHistoryTab(QWidget):
         self.window = window
         self.config = plugin.config
         self.wallet = window.wallet
-        self._detail_dialogs: List['SwapComponentsDialog'] = []
+
+        self.hist_model = SwapHistoryModel(plugin, window)
+        self.hist_list = HistoryList(window, self.hist_model)
+        self.hist_model.set_view(self.hist_list)
+        # HistoryModel parents itself to the window, which outlives this tab by
+        # a whole wallet; hold it here instead so it is torn down with the tab.
+        self.hist_model.setParent(self)
+        # What ElectrumWindow.do_search filters when this tab is the current
+        # one (main_window.py: ``tab.searchable_list.filter(t)``).
+        self.searchable_list = self.hist_list
 
         outer = QVBoxLayout(self)
-
-        self.summary_label = QLabel("—")
-        self.summary_label.setToolTip(_(
-            "Every swap this wallet has been part of, served or its own.\n"
-            "The net return covers only swaps this server served, that have "
-            "settled, and whose every leg is in this wallet."))
-        outer.addWidget(self.summary_label)
-
         hint = QLabel(_(
-            "One row per swap, with the components it is made of underneath. "
-            "Double-click a component to show it in the History tab."))
+            "The same history as the History tab, with each swap named after "
+            "the side this wallet was on. Electrum's History tab is left "
+            "exactly as it is."))
         hint.setEnabled(False)  # renders dimmed, like secondary text
         outer.addWidget(hint)
-
-        self.swap_tree = QTreeWidget()
-        self.swap_tree.setHeaderLabels(
-            [_("Date"), _("Status"), _("Swap"), _("Return")])
-        self.swap_tree.setRootIsDecorated(True)
-        self.swap_tree.itemDoubleClicked.connect(self.on_item_activated)
-        outer.addWidget(self.swap_tree, 1)
+        toolbar = self.hist_list.create_toolbar(self.config)
+        if toolbar is not None:
+            outer.addLayout(toolbar)
+        outer.addWidget(self.hist_list, 1)
+        if toolbar is not None:
+            self.hist_list.show_toolbar()
 
         self._timer: Optional[QTimer] = QTimer(self)
         self._timer.timeout.connect(self.refresh)
         self._timer.start(self.REFRESH_MS)
         self.refresh()
 
-    # ------------------------------------------------------------------ build
     def refresh(self) -> None:
+        """Rebuild the history, and survive a wallet that cannot produce one."""
         try:
-            rows = build_swap_rows(self.wallet, include_own=True,
-                                   include_pending=True)
+            self.hist_model.refresh('swapserver_gui')
         except Exception:
-            self.plugin.logger.debug("failed to compute swap history", exc_info=True)
-            return
-        summary = get_swap_summary(rows)
-        self.summary_label.setText(format_summary_line(
-            num_swaps=summary["num_swaps"],
-            net_return=_fmt_sat(self.config, summary["overall_return_sat"]),
-            swaps_per_day=summary["swaps_per_day"],
-            num_batched=summary["num_batched"],
-            num_incomplete=summary["num_incomplete"],
-            num_unattributed=summary["num_unattributed"],
-            num_pending=summary["num_pending"],
-            counts_own=True,
-        ))
-        # Remember which swaps were expanded, so a refresh does not collapse the
-        # row the operator is reading. The timer fires every few seconds.
-        expanded: Set[str] = {
-            self.swap_tree.topLevelItem(i).data(
-                self.COL_DATE, Qt.ItemDataRole.UserRole).payment_hash
-            for i in range(self.swap_tree.topLevelItemCount())
-            if self.swap_tree.topLevelItem(i).isExpanded()
-        }
-        self.swap_tree.clear()
-        for row in reversed(rows):  # newest first
-            item = self._build_swap_item(row)
-            self.swap_tree.addTopLevelItem(item)
-            # Only after the item is in the tree: setExpanded on a detached
-            # QTreeWidgetItem has no model to record it against, and is lost.
-            if row.payment_hash in expanded:
-                item.setExpanded(True)
-        for col in range(4):
-            self.swap_tree.resizeColumnToContents(col)
-
-    def _build_swap_item(self, row: 'ServedSwapRow') -> QTreeWidgetItem:
-        item = QTreeWidgetItem([
-            row.date or "—",
-            format_swap_status(row.status),
-            row.label,
-            self._return_text(row),
-        ])
-        item.setData(self.COL_DATE, Qt.ItemDataRole.UserRole, row)
-        for col in range(4):
-            item.setToolTip(col, self._swap_tooltip(row))
-        if not row.counts_towards_total:
-            # Dimmed for the same reason the number is withheld: this row is not
-            # part of the total printed above it.
-            item.setForeground(self.COL_RETURN, ColorScheme.GRAY.as_color())
-        if row.status is SwapStatus.LOCAL:
-            # The one status that is a problem rather than a wait: a batch that
-            # was never broadcast and that upstream will not retry.
-            item.setForeground(self.COL_STATUS, ColorScheme.RED.as_color())
-        elif row.status is not SwapStatus.FINAL:
-            item.setForeground(self.COL_STATUS, ColorScheme.GRAY.as_color())
-        for component in row.components:
-            item.addChild(self._build_component_item(component))
-        return item
-
-    def _build_component_item(self, component: 'SwapComponent') -> QTreeWidgetItem:
-        if component.in_wallet:
-            location = _("in this wallet")
-        elif component.is_missing:
-            # Ours, and absent: this is the leg that makes the row incomplete,
-            # so it has to read differently from the taker's own leg.
-            location = _("missing")
-        elif component.txid:
-            location = _("the taker's")
-        else:
-            location = _("not recorded")
-        amount = "—" if component.value_sat is None \
-            else _fmt_sat(self.config, component.value_sat)
-        item = QTreeWidgetItem(["", location, component.title, amount])
-        item.setData(self.COL_DATE, Qt.ItemDataRole.UserRole, component)
-        identifier = component.txid or component.payment_hash or ""
-        tip = component.detail
-        if identifier:
-            tip += "\n\n" + identifier
-        for col in range(4):
-            item.setToolTip(col, tip)
-        if not component.in_wallet:
-            # Nothing to jump to; say so by dimming the row rather than by
-            # letting a double-click silently do nothing.
-            item.setForeground(self.COL_STATUS, ColorScheme.GRAY.as_color())
-        return item
-
-    def _return_text(self, row: 'ServedSwapRow') -> str:
-        """What to print in the Return column.
-
-        Four different silences, deliberately not collapsed into one: a swap
-        that has not finished has no result *yet*, one of the operator's own
-        swaps has a cost rather than a return, and an incomplete swap has a
-        result nobody can compute.  Printing "—" for all three would hide which
-        of them the operator is looking at.
-        """
-        if row.status is not SwapStatus.FINAL:
-            return "—"
-        if row.role is SwapRole.OWN:
-            return _("— own swap")
-        if row.return_sat is None:
-            return _("— incomplete")
-        return _fmt_sat(self.config, row.return_sat)
-
-    def _swap_tooltip(self, row: 'ServedSwapRow') -> str:
-        tip = _("{n} component(s); double-click to expand, or for details.").format(
-            n=len(row.components))
-        if row.status is SwapStatus.LOCAL:
-            tip += "\n\n" + format_local_note()
-        if row.missing_legs:
-            tip += "\n\n" + format_incomplete_note(missing_legs=row.missing_legs)
-        if row.role is SwapRole.UNKNOWN:
-            tip += "\n\n" + format_unattributed_note()
-        if row.batched_with:
-            tip += "\n\n" + format_batched_note(batched_with=row.batched_with)
-        return tip
-
-    # ----------------------------------------------------------- interaction
-    def on_item_activated(self, item: QTreeWidgetItem, column: int) -> None:
-        """A swap row opens its detail window; a component jumps to History."""
-        data = item.data(self.COL_DATE, Qt.ItemDataRole.UserRole)
-        if isinstance(data, SwapComponent):
-            if not data.in_wallet:
-                return  # dimmed already; nothing to jump to
-            show_in_history(self.window, txid=data.txid,
-                            payment_hash=data.payment_hash)
-            return
-        if data is None:
-            return
-        dialog = SwapComponentsDialog(self, data)
-        # Non-modal, so nothing else holds a reference and Python would collect
-        # the window the moment this returns. Drop ours when it closes.
-        self._detail_dialogs.append(dialog)
-        dialog.finished.connect(
-            lambda _result, d=dialog: self._detail_dialogs.remove(d)
-            if d in self._detail_dialogs else None)
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
+            # Same bargain as everywhere else in this plugin: a tab that cannot
+            # be rebuilt keeps showing the last good one rather than taking the
+            # window down with it.
+            self.plugin.logger.debug("failed to refresh swap history tab",
+                                     exc_info=True)
 
     def clean_up(self) -> None:
         """Stop the refresh timer before the wallet goes away underneath it."""
@@ -1294,11 +1347,16 @@ class Plugin(SwapServerGuiPlugin):
         self._window = window
         self._tab = SwapServerTab(self, window)
         window.tabs.addTab(self._tab, read_QIcon("lightning.png"), _("Swap Server"))
-        # The swap-shaped view of the wallet's history.  A tab of its own rather
-        # than a rewrite of Electrum's History tab, which is left untouched.
+        # A second copy of the History tab, in which the swap rows say which
+        # side of each swap this wallet was on.  A tab of its own rather than a
+        # rewrite of Electrum's History tab, which is left untouched.
         self._history_tab = SwapHistoryTab(self, window)
         window.tabs.addTab(self._history_tab, read_QIcon("lightning.png"),
                            _("History (Swaps)"))
+        # Logged as the counterpart of "wallet has no lightning; not adding
+        # ...": between them the log says which of the two happened, which is
+        # the first question when an operator reports a missing tab.
+        self.logger.info("added the Swap Server and History (Swaps) tabs")
 
     def _remove_tab(self) -> None:
         if self._window is None:
