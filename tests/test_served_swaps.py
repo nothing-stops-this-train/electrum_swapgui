@@ -33,8 +33,13 @@ for _p in (_ELECTRUM_SRC, _PLUGINS_DIR):
 
 from electrum.wallet_db import WalletDB  # noqa: E402
 
+from electrum.address_synchronizer import (  # noqa: E402
+    TX_HEIGHT_FUTURE, TX_HEIGHT_LOCAL, TX_HEIGHT_UNCONF_PARENT,
+    TX_HEIGHT_UNCONFIRMED,
+)
+
 from swapserver_gui.swapserver_gui import (  # noqa: E402
-    ComponentKind, SERVED_SWAPS_DB_KEY, SwapRole, SwapServerGuiPlugin,
+    ComponentKind, SERVED_SWAPS_DB_KEY, SwapRole, SwapServerGuiPlugin, SwapStatus,
     build_served_swap_rows, classify_swap, format_batched_note,
     format_incomplete_note, format_summary_line, format_swap_label,
     format_unattributed_note, get_swap_history, get_swap_summary,
@@ -42,8 +47,9 @@ from swapserver_gui.swapserver_gui import (  # noqa: E402
     served_swaps_ledger, swap_margin_sat,
 )
 from swapserver_gui.served_swaps import (  # noqa: E402
-    FUNDING_OUTPUT_VBYTES, claim_input_vbytes, flatten_history, split_fee,
-    relabel_swap_history_groups, taker_did_forward_swap,
+    FUNDING_OUTPUT_VBYTES, build_swap_rows, claim_input_vbytes, flatten_history,
+    format_local_note, format_swap_status, split_fee, swap_status,
+    taker_did_forward_swap,
 )
 
 
@@ -151,16 +157,17 @@ def _ln(payment_hash: str, value: int, *, ts: int = 1_700_000_000) -> Dict[str, 
 
 def _make_wallet(swaps: Dict[str, _Swap], *, history: Optional[List[Dict[str, Any]]] = None,
                  confirmed: bool = True,
-                 ln_hashes: Optional[Set[str]] = None) -> Any:
+                 heights: Optional[Dict[str, int]] = None) -> Any:
     """A wallet stand-in with a *real* db, so the ledger is really persisted.
 
     ``history`` is a flat list of entries; ``get_full_history`` keys them the way
     the wallet does, which the row builder must not depend on.
 
-    ``ln_hashes`` is what ``lnworker.get_lightning_history`` reports, which is
-    how :func:`relabel_swap_history_groups` decides whether a swap group will
-    have a lightning member to be expanded with.  It defaults to the payment
-    hashes in ``history``, so a caller only passes it to make the two disagree.
+    ``heights`` overrides ``adb.get_tx_height`` per txid, which is what decides
+    a swap's :class:`SwapStatus`.  Without it every transaction reports the same
+    height, per ``confirmed``.  Use the ``TX_HEIGHT_*`` constants for the
+    negative ones -- ``TX_HEIGHT_LOCAL`` is the interesting case, because that
+    is a batch transaction that was never broadcast.
     """
     wallet = mock.MagicMock()
     wallet.db = WalletDB('', storage=None, upgrade=True)
@@ -168,15 +175,16 @@ def _make_wallet(swaps: Dict[str, _Swap], *, history: Optional[List[Dict[str, An
     # No watcher: lockup values then fall back to the swap's expected amount,
     # which is what they are in every normal case anyway.
     wallet.lnworker.swap_manager.lnwatcher = None
-    wallet.adb.get_tx_height.return_value = _TxHeight(100 if confirmed else 0)
+    default_height = 100 if confirmed else 0
+    if heights is None:
+        wallet.adb.get_tx_height.return_value = _TxHeight(default_height)
+    else:
+        wallet.adb.get_tx_height.side_effect = \
+            lambda txid: _TxHeight(heights.get(txid, default_height))
     entries = history if history is not None else []
     wallet.get_full_history.return_value = {
         (item.get('txid') or item.get('payment_hash')): item for item in entries
     }
-    if ln_hashes is None:
-        ln_hashes = {item['payment_hash'] for item in entries
-                     if item.get('lightning') and item.get('payment_hash')}
-    wallet.lnworker.get_lightning_history.return_value = {h: None for h in ln_hashes}
     return wallet
 
 
@@ -515,77 +523,6 @@ class SwapLabelTests(unittest.TestCase):
         self.assertNotIn("Served ", label)
         self.assertNotIn("My ", label)
 
-    def test_relabelling_a_group_mapping(self) -> None:
-        # This is what wraps SwapManager.get_groups_for_onchain_history, which
-        # rewrites its labels into the wallet on every history refresh.
-        swap = _served_forward_swap(funding_txid='f', spending_txid='tx_claim')
-        wallet = _make_wallet({'aa' * 32: swap}, ln_hashes={'aa' * 32})
-        sm = wallet.lnworker.swap_manager
-        sm.config.format_amount_and_units.return_value = "0.99 mBTC"
-        groups = {'tx_claim': {'group_id': 'tx_claim', 'label': 'Claim transaction',
-                               'group_label': 'Reverse swap 0.99 mBTC'}}
-        relabel_swap_history_groups(wallet, sm, groups)
-        entry = groups['tx_claim']
-        # upstream calls a *served forward* swap a "Reverse swap", because it
-        # names swaps after our own copy's is_reverse flag
-        self.assertIn("Served forward swap", entry['group_label'])
-        # The lightning payment is in the history, so this group has two members
-        # and will be shown expanded: the leg keeps its component name.
-        self.assertEqual(entry['label'], 'Claim transaction')
-
-    def test_a_group_that_will_collapse_gets_the_swap_label_on_its_leg(self) -> None:
-        # No lightning payment => the group has one member => get_full_history
-        # replaces it by that member and shows the *leg* label.  Rewriting only
-        # group_label leaves a bare "Claim transaction" in the history with no
-        # swap row anywhere, which is what this prevents.
-        swap = _served_forward_swap(funding_txid='f', spending_txid='tx_claim')
-        wallet = _make_wallet({'aa' * 32: swap}, ln_hashes=set())
-        sm = wallet.lnworker.swap_manager
-        sm.config.format_amount_and_units.return_value = "0.99 mBTC"
-        groups = {'tx_claim': {'group_id': 'tx_claim', 'label': 'Claim transaction',
-                               'group_label': 'Reverse swap 0.99 mBTC'}}
-        relabel_swap_history_groups(wallet, sm, groups)
-        entry = groups['tx_claim']
-        self.assertIn("Served forward swap", entry['group_label'])
-        self.assertIn("Served forward swap", entry['label'])
-
-    def test_the_prepayment_alone_keeps_a_group_from_collapsing(self) -> None:
-        # A served reverse swap whose hold invoice never settled still has the
-        # prepayment in the history, so the group has two members.
-        swap = _served_reverse_swap(funding_txid='tx_fund', spending_txid='tx_refund')
-        wallet = _make_wallet({'aa' * 32: swap}, ln_hashes={'01' * 32})
-        sm = wallet.lnworker.swap_manager
-        sm.config.format_amount_and_units.return_value = "1 mBTC"
-        groups = {'tx_fund': {'group_id': 'tx_fund', 'label': 'Funding transaction',
-                              'group_label': 'Forward swap 1 mBTC'}}
-        relabel_swap_history_groups(wallet, sm, groups)
-        self.assertEqual(groups['tx_fund']['label'], 'Funding transaction')
-
-    def test_two_onchain_members_never_collapse(self) -> None:
-        # A refunded swap has both the funding and the refund tx in its group,
-        # so it is expanded regardless of what lightning did.
-        swap = _served_reverse_swap(funding_txid='tx_fund', spending_txid='tx_refund',
-                                    preimage=None)
-        wallet = _make_wallet({'aa' * 32: swap}, ln_hashes=set())
-        sm = wallet.lnworker.swap_manager
-        sm.config.format_amount_and_units.return_value = "1 mBTC"
-        groups = {
-            'tx_fund': {'group_id': 'tx_fund', 'label': 'Funding transaction',
-                        'group_label': 'Forward swap 1 mBTC'},
-            'tx_refund': {'group_id': 'tx_fund', 'label': 'Refund transaction',
-                          'group_label': 'Forward swap 1 mBTC'},
-        }
-        relabel_swap_history_groups(wallet, sm, groups)
-        self.assertEqual(groups['tx_fund']['label'], 'Funding transaction')
-        self.assertEqual(groups['tx_refund']['label'], 'Refund transaction')
-
-    def test_relabelling_leaves_unrelated_groups_alone(self) -> None:
-        wallet = _make_wallet({})
-        sm = wallet.lnworker.swap_manager
-        groups = {'chan': {'group_id': 'chan', 'group_label': 'Open channel x'}}
-        relabel_swap_history_groups(wallet, sm, groups)
-        self.assertEqual(groups['chan']['group_label'], 'Open channel x')
-
 
 class SummaryLineTests(unittest.TestCase):
     """The strings the operator reads; pure, so testable without PyQt6."""
@@ -714,91 +651,6 @@ class RecorderTests(unittest.TestCase):
         plugin = self._plugin(sm, wallet)
         plugin._install_served_swap_recorder(sm)
         plugin._remove_served_swap_recorder(sm)
-
-
-class _GroupBuildingSwapManager:
-    """Stand-in exposing the history-group builder the relabeller wraps."""
-
-    def __init__(self, swaps: Dict[str, _Swap]) -> None:
-        self._swaps = swaps
-        self.calls = 0
-        self.config = mock.MagicMock()
-        self.config.format_amount_and_units.return_value = "0.99 mBTC"
-
-    def get_groups_for_onchain_history(self) -> Dict[str, Dict[str, Any]]:
-        self.calls += 1
-        return {'tx_claim': {'group_id': 'tx_claim', 'label': 'Claim transaction',
-                             'group_label': 'Reverse swap 0.99 mBTC'}}
-
-
-class HistoryRelabellerTests(unittest.TestCase):
-    """Wrapping ``get_groups_for_onchain_history`` on the swap manager."""
-
-    def _plugin(self, sm: Any, wallet: Any) -> SwapServerGuiPlugin:
-        plugin = SwapServerGuiPlugin(mock.MagicMock(), mock.MagicMock(), "swapserver_gui")
-        plugin.wallet = wallet
-        plugin._sm = sm
-        return plugin
-
-    def _sm_and_wallet(self):
-        swaps = {'aa' * 32: _served_forward_swap(funding_txid='f', spending_txid='tx_claim')}
-        wallet = _make_wallet(swaps)
-        return _GroupBuildingSwapManager(swaps), wallet
-
-    def test_labels_are_rewritten(self) -> None:
-        sm, wallet = self._sm_and_wallet()
-        self._plugin(sm, wallet)._install_history_relabeller(sm)
-        groups = sm.get_groups_for_onchain_history()
-        self.assertIn("Served forward swap", groups['tx_claim']['group_label'])
-        self.assertEqual(sm.calls, 1)  # upstream still ran exactly once
-
-    def test_install_is_idempotent(self) -> None:
-        sm, wallet = self._sm_and_wallet()
-        plugin = self._plugin(sm, wallet)
-        plugin._install_history_relabeller(sm)
-        wrapped = sm.get_groups_for_onchain_history
-        plugin._install_history_relabeller(sm)
-        self.assertIs(sm.get_groups_for_onchain_history, wrapped)
-
-    def test_remove_restores_the_original(self) -> None:
-        sm, wallet = self._sm_and_wallet()
-        plugin = self._plugin(sm, wallet)
-        plugin._install_history_relabeller(sm)
-        plugin._remove_history_relabeller(sm)
-        self.assertNotIn('get_groups_for_onchain_history', sm.__dict__)
-        groups = sm.get_groups_for_onchain_history()
-        self.assertEqual(groups['tx_claim']['group_label'], 'Reverse swap 0.99 mBTC')
-
-    def test_remove_is_idempotent(self) -> None:
-        sm, wallet = self._sm_and_wallet()
-        plugin = self._plugin(sm, wallet)
-        plugin._remove_history_relabeller(sm)  # never installed
-        plugin._install_history_relabeller(sm)
-        plugin._remove_history_relabeller(sm)
-        plugin._remove_history_relabeller(sm)
-
-    def test_a_failure_falls_back_to_upstreams_labels(self) -> None:
-        # The history must still render if we cannot classify a swap.
-        sm, wallet = self._sm_and_wallet()
-        self._plugin(sm, wallet)._install_history_relabeller(sm)
-        with mock.patch("swapserver_gui.served_swaps.relabel_swap_history_groups",
-                        side_effect=RuntimeError("boom")):
-            groups = sm.get_groups_for_onchain_history()
-        self.assertEqual(groups['tx_claim']['group_label'], 'Reverse swap 0.99 mBTC')
-
-    def test_unbind_wallet_removes_it(self) -> None:
-        sm, wallet = self._sm_and_wallet()
-        plugin = self._plugin(sm, wallet)
-        plugin._install_history_relabeller(sm)
-        plugin.unbind_wallet()
-        self.assertNotIn('get_groups_for_onchain_history', sm.__dict__)
-        self.assertIsNone(plugin.wallet)
-
-    def test_swap_manager_without_the_method(self) -> None:
-        sm, wallet = mock.Mock(spec=[]), _make_wallet({})
-        plugin = self._plugin(sm, wallet)
-        plugin._install_history_relabeller(sm)
-        plugin._remove_history_relabeller(sm)
 
 
 class SwapMarginTests(unittest.TestCase):
@@ -1024,6 +876,172 @@ class SummaryExcludesUncountableRowsTests(unittest.TestCase):
         self.assertIn("Lightning payment", note)
         self.assertIn("unknown, not zero", note)
         self.assertIn("which side", format_unattributed_note())
+
+
+class SwapStatusTests(unittest.TestCase):
+    """Which height means what.
+
+    The confirmed test has to stay exactly the one the row builder always used
+    -- above ``TX_HEIGHT_UNCONFIRMED`` -- or the population of the Swap Server
+    tab would change silently.  The rest is about telling the three "not yet"
+    heights apart, because only one of them is a problem.
+    """
+
+    def _wallet_with_spending_height(self, height: int) -> Any:
+        swap = _served_reverse_swap(funding_txid='tx_fund', spending_txid='tx_spend')
+        return _make_wallet({'aa' * 32: swap}, heights={'tx_spend': height}), swap
+
+    def test_confirmed_is_final(self) -> None:
+        wallet, swap = self._wallet_with_spending_height(100)
+        self.assertIs(swap_status(wallet, swap), SwapStatus.FINAL)
+
+    def test_mempool_is_unconfirmed(self) -> None:
+        for height in (TX_HEIGHT_UNCONFIRMED, TX_HEIGHT_UNCONF_PARENT):
+            with self.subTest(height=height):
+                wallet, swap = self._wallet_with_spending_height(height)
+                self.assertIs(swap_status(wallet, swap), SwapStatus.UNCONFIRMED)
+
+    def test_never_broadcast_is_local(self) -> None:
+        wallet, swap = self._wallet_with_spending_height(TX_HEIGHT_LOCAL)
+        self.assertIs(swap_status(wallet, swap), SwapStatus.LOCAL)
+
+    def test_timelocked_is_in_flight(self) -> None:
+        wallet, swap = self._wallet_with_spending_height(TX_HEIGHT_FUTURE)
+        self.assertIs(swap_status(wallet, swap), SwapStatus.IN_FLIGHT)
+
+    def test_unspent_lockup_is_in_flight(self) -> None:
+        swap = _served_reverse_swap(funding_txid='tx_fund', spending_txid=None)
+        wallet = _make_wallet({'aa' * 32: swap})
+        self.assertIs(swap_status(wallet, swap), SwapStatus.IN_FLIGHT)
+
+    def test_an_unreadable_height_is_not_reported_as_settled(self) -> None:
+        # Whatever went wrong, the one answer that must not come back is
+        # "final": that would put an unsettled swap into the net return.
+        swap = _served_reverse_swap(funding_txid='tx_fund', spending_txid='tx_spend')
+        wallet = _make_wallet({'aa' * 32: swap})
+        wallet.adb.get_tx_height.side_effect = RuntimeError("no chain")
+        self.assertIs(swap_status(wallet, swap), SwapStatus.IN_FLIGHT)
+
+    def test_every_status_has_a_name(self) -> None:
+        for status in SwapStatus:
+            with self.subTest(status=status):
+                self.assertTrue(format_swap_status(status))
+                self.assertNotIn('SwapStatus', format_swap_status(status))
+
+
+class PendingRowTests(unittest.TestCase):
+    """What the Swaps history tab adds, and what the Swap Server tab must not."""
+
+    def _local_swap_wallet(self) -> Any:
+        swap = _served_reverse_swap(funding_txid='tx_fund', spending_txid='tx_spend')
+        return _make_wallet(
+            {'aa' * 32: swap},
+            history=[_onchain('tx_fund', -100_000, fee=300),
+                     _ln('aa' * 32, 99_000), _ln('01' * 32, 500)],
+            heights={'tx_spend': TX_HEIGHT_LOCAL, 'tx_fund': 100},
+        )
+
+    def test_the_served_table_still_skips_unsettled_swaps(self) -> None:
+        # The whole point of the default: the net return covers finished swaps.
+        self.assertEqual(build_served_swap_rows(self._local_swap_wallet()), [])
+
+    def test_the_swaps_tab_shows_a_local_swap_and_says_so(self) -> None:
+        rows = build_swap_rows(self._local_swap_wallet(),
+                               include_own=True, include_pending=True)
+        self.assertEqual(len(rows), 1)
+        self.assertIs(rows[0].status, SwapStatus.LOCAL)
+
+    def test_an_unsettled_swap_never_counts_towards_the_total(self) -> None:
+        # Even a complete, served, unambiguous row: it has not happened yet.
+        rows = build_swap_rows(self._local_swap_wallet(),
+                               include_own=True, include_pending=True)
+        row = rows[0]
+        self.assertTrue(row.is_complete)
+        self.assertIs(row.role, SwapRole.SERVED)
+        self.assertFalse(row.counts_towards_total)
+        self.assertEqual(get_swap_summary(rows)['overall_return_sat'], 0)
+        self.assertEqual(get_swap_summary(rows)['num_pending'], 1)
+
+    def test_own_swaps_appear_only_when_asked_for(self) -> None:
+        swaps = {
+            'aa' * 32: _served_reverse_swap(funding_txid='tx_s', spending_txid='tx_sc'),
+            'bb' * 32: _own_reverse_swap(funding_txid='tx_o', spending_txid='tx_oc'),
+        }
+        wallet = _make_wallet(swaps, history=[
+            _onchain('tx_s', -100_000, fee=300), _ln('aa' * 32, 99_000),
+            _onchain('tx_oc', 99_000, fee=300), _ln('bb' * 32, -100_000),
+        ])
+        served_only = build_swap_rows(wallet)
+        self.assertEqual([r.role for r in served_only], [SwapRole.SERVED])
+        both = build_swap_rows(wallet, include_own=True)
+        self.assertEqual({r.role for r in both}, {SwapRole.SERVED, SwapRole.OWN})
+        # ...and the operator's own swap is still not revenue.
+        own = [r for r in both if r.role is SwapRole.OWN][0]
+        self.assertFalse(own.counts_towards_total)
+
+    def test_a_swap_with_nothing_in_the_history_yet_still_gets_a_row(self) -> None:
+        # An in-flight swap has no leg in the history at all.  Dropping it would
+        # hide exactly the rows the Swaps history tab exists to show.
+        swap = _served_reverse_swap(funding_txid=None, spending_txid=None)
+        wallet = _make_wallet({'aa' * 32: swap})
+        record_served_swap(wallet, 'aa' * 32)
+        rows = build_swap_rows(wallet, include_own=True, include_pending=True)
+        self.assertEqual(len(rows), 1)
+        self.assertIs(rows[0].status, SwapStatus.IN_FLIGHT)
+        # dated from the ledger, which is when our server created it
+        self.assertTrue(rows[0].timestamp)
+        self.assertTrue(rows[0].date)
+
+    def test_a_swap_with_no_date_at_all_prints_none(self) -> None:
+        # No ledger entry either (a swap older than the ledger): rather than
+        # invent a date, and sort the row into 1970, the row carries no date.
+        swap = _served_reverse_swap(funding_txid=None, spending_txid=None)
+        wallet = _make_wallet({'aa' * 32: swap})
+        rows = build_swap_rows(wallet, include_own=True, include_pending=True)
+        self.assertEqual(rows[0].date, "")
+
+    def test_an_undated_row_does_not_flatten_the_rate(self) -> None:
+        day = 86400
+        rows = [
+            {'return_sat': 10, 'timestamp': 10 * day, 'status': SwapStatus.FINAL},
+            {'return_sat': 10, 'timestamp': 12 * day, 'status': SwapStatus.FINAL},
+            # the undated one: 1970 would make the span 4383 days
+            {'return_sat': None, 'timestamp': 0, 'status': SwapStatus.IN_FLIGHT},
+        ]
+        summary = get_swap_summary(rows)
+        self.assertEqual(summary['swaps_per_day'], 1.5)  # 3 rows over 2 days
+        self.assertEqual(summary['overall_return_sat'], 20)
+        self.assertEqual(summary['num_pending'], 1)
+
+    def test_pending_is_not_also_reported_as_incomplete(self) -> None:
+        # A swap that has not settled is not a swap with a missing leg; the
+        # remedies are nothing alike, and counting it twice in the "not counted"
+        # note would read as two separate problems.
+        rows = [{'return_sat': None, 'timestamp': 1, 'status': SwapStatus.LOCAL,
+                 'missing_legs': ('Claim transaction',), 'role': SwapRole.SERVED}]
+        summary = get_swap_summary(rows)
+        self.assertEqual(summary['num_pending'], 1)
+        self.assertEqual(summary['num_incomplete'], 0)
+
+    def test_the_summary_line_counts_pending_out_loud(self) -> None:
+        text = format_summary_line(num_swaps=4, net_return="9 sat", swaps_per_day=1.0,
+                                   num_batched=0, num_pending=2)
+        self.assertIn("Not counted", text)
+        self.assertIn("2 not settled yet", text)
+
+    def test_the_summary_line_says_when_own_swaps_are_in_the_count(self) -> None:
+        # "Swaps served: 17" over a table counting the operator's own swaps too
+        # would be a wrong number, not just a loose phrase.
+        text = format_summary_line(num_swaps=17, net_return="9 sat", swaps_per_day=1.0,
+                                   num_batched=0, counts_own=True)
+        self.assertNotIn("Swaps served:", text)
+        self.assertIn("17", text)
+        self.assertIn("served and own", text)
+
+    def test_the_local_note_explains_the_stranded_batch(self) -> None:
+        note = format_local_note()
+        self.assertIn("never broadcast", note)
+        self.assertIn("left out of the net return", note)
 
 
 if __name__ == "__main__":

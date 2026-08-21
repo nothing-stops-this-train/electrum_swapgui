@@ -728,15 +728,19 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(
             get_swap_summary([]),
             {'num_swaps': 0, 'overall_return_sat': 0, 'swaps_per_day': 0.0,
-             'num_batched': 0, 'num_incomplete': 0, 'num_unattributed': 0},
+             'num_batched': 0, 'num_incomplete': 0, 'num_unattributed': 0,
+             'num_pending': 0},
         )
 
     def test_aggregates_and_rate(self):
         day = 86400
+        # Timestamps are deliberately non-zero: a falsy timestamp now means "no
+        # date known", which is a state only an unsettled swap can be in, and
+        # such a row is kept out of the date span (see test_undated_row_*).
         history = [
-            {'return_sat': 100, 'timestamp': 0, 'date': 'x', 'label': 'a'},
-            {'return_sat': -30, 'timestamp': day, 'date': 'y', 'label': 'b'},
-            {'return_sat': 50, 'timestamp': 2 * day, 'date': 'z', 'label': 'c'},
+            {'return_sat': 100, 'timestamp': day, 'date': 'x', 'label': 'a'},
+            {'return_sat': -30, 'timestamp': 2 * day, 'date': 'y', 'label': 'b'},
+            {'return_sat': 50, 'timestamp': 3 * day, 'date': 'z', 'label': 'c'},
         ]
         summary = get_swap_summary(history)
         self.assertEqual(summary['num_swaps'], 3)

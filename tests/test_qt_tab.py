@@ -44,7 +44,7 @@ except ImportError:
 
 from swapserver_gui.swapserver_gui import (  # noqa: E402
     AnnounceState, ComponentKind, ServedSwapRow, SwapComponent, SwapRole,
-    SwapServerGuiPlugin,
+    SwapServerGuiPlugin, SwapStatus,
 )
 from swapserver_gui import nostr_check as nc  # noqa: E402
 from swapserver_gui.nostr_check import CheckStatus  # noqa: E402
@@ -93,12 +93,13 @@ def _component(kind, title, *, txid=None, payment_hash=None, value_sat=None,
 
 def _row(*, label='⇄ Served forward swap 0.2 mBTC', return_sat=205,
          payment_hash='aa' * 32, batched_with=0, role=SwapRole.SERVED,
-         missing_legs=(), ln_in_wallet=True):
+         missing_legs=(), ln_in_wallet=True, status=SwapStatus.FINAL,
+         date='2025-09-04'):
     """A served forward swap: the taker funded, we claimed and paid lightning."""
     return ServedSwapRow(
         payment_hash=payment_hash,
         label=label,
-        date='2025-09-04',
+        date=date,
         timestamp=1756982141,
         return_sat=return_sat,
         taker_is_forward=True,
@@ -121,6 +122,7 @@ def _row(*, label='⇄ Served forward swap 0.2 mBTC', return_sat=205,
         batched_with=batched_with,
         role=role,
         missing_legs=missing_legs,
+        status=status,
     )
 
 
@@ -129,6 +131,22 @@ def _incomplete_row(**kw):
     kw.setdefault('return_sat', None)
     kw.setdefault('missing_legs', ("Lightning payment",))
     kw.setdefault('ln_in_wallet', False)
+    return _row(**kw)
+
+
+def _local_row(**kw):
+    """A swap whose settling transaction never left the wallet."""
+    kw.setdefault('status', SwapStatus.LOCAL)
+    kw.setdefault('payment_hash', 'cc' * 32)
+    kw.setdefault('label', '⇄ Served reverse swap 0.2 mBTC')
+    return _row(**kw)
+
+
+def _own_row(**kw):
+    """One of the operator's own swaps: a cost, not a return."""
+    kw.setdefault('role', SwapRole.OWN)
+    kw.setdefault('payment_hash', 'bb' * 32)
+    kw.setdefault('label', '↪ My reverse swap 0.2 mBTC')
     return _row(**kw)
 
 
@@ -757,6 +775,254 @@ class ShowInHistoryTests(unittest.TestCase):
         self.assertEqual(
             qt_mod._tab_index_for_widget(window.tabs, window.history_list), 1)
         self.assertEqual(qt_mod._tab_index_for_widget(window.tabs, None), -1)
+
+
+@unittest.skipUnless(HAVE_QT, "PyQt6 not installed")
+class SwapHistoryTabTests(_TabHarness, unittest.TestCase):
+    """The "History (Swaps)" tab: the wallet's history, reorganised per swap.
+
+    The reason this tab exists is that Electrum's own History tab is now left
+    exactly as upstream renders it, so everything the operator used to read
+    from relabelled rows has to be readable here instead.
+    """
+
+    #: mirrors SwapHistoryTab.COL_*
+    DATE, STATUS, LABEL, RETURN = range(4)
+
+    def _make_history_tab(self, rows):
+        from swapserver_gui import qt as qt_mod
+        _tab, plugin, _sm, window = self._make_tab()
+        with mock.patch("swapserver_gui.qt.build_swap_rows", return_value=rows):
+            tab = qt_mod.SwapHistoryTab(plugin, window)
+        self.addCleanup(tab.clean_up)
+        return tab, window
+
+    def _top_items(self, tab):
+        tree = tab.swap_tree
+        return [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+
+    def _by_label(self, tab):
+        return {item.text(self.LABEL): item for item in self._top_items(tab)}
+
+    # ------------------------------------------------------------------ shape
+    def test_one_top_level_row_per_swap_with_its_components_underneath(self):
+        tab, _ = self._make_history_tab([_row(), _own_row()])
+        items = self._top_items(tab)
+        self.assertEqual(len(items), 2)
+        for item in items:
+            self.assertEqual(item.childCount(), 3)
+        titles = [items[0].child(i).text(self.LABEL) for i in range(3)]
+        self.assertEqual(titles, ["Lightning payment", "Funding transaction",
+                                  "Claim transaction"])
+
+    def test_newest_swap_first(self):
+        old = _row(payment_hash='11' * 32, date='2025-01-01')
+        new = _row(payment_hash='22' * 32, date='2025-09-04')
+        tab, _ = self._make_history_tab([old, new])  # builder returns oldest first
+        self.assertEqual(self._top_items(tab)[0].text(self.DATE), '2025-09-04')
+
+    def test_own_swaps_are_listed_alongside_served_ones(self):
+        tab, _ = self._make_history_tab([_row(), _own_row()])
+        labels = list(self._by_label(tab))
+        self.assertTrue(any(l.startswith('⇄') for l in labels), labels)
+        self.assertTrue(any(l.startswith('↪') for l in labels), labels)
+
+    def test_it_asks_for_own_and_pending_swaps(self):
+        # The Swap Server tab's table deliberately asks for neither.
+        from swapserver_gui import qt as qt_mod
+        _tab, plugin, _sm, window = self._make_tab()
+        with mock.patch("swapserver_gui.qt.build_swap_rows",
+                        return_value=[]) as build:
+            tab = qt_mod.SwapHistoryTab(plugin, window)
+            self.addCleanup(tab.clean_up)
+        self.assertEqual(build.call_args.kwargs,
+                         {'include_own': True, 'include_pending': True})
+
+    # ----------------------------------------------------------- the columns
+    def test_the_status_column_names_the_state(self):
+        tab, _ = self._make_history_tab([_row(), _local_row()])
+        by_label = self._by_label(tab)
+        self.assertEqual(by_label['⇄ Served forward swap 0.2 mBTC'].text(self.STATUS),
+                         "Confirmed")
+        self.assertEqual(by_label['⇄ Served reverse swap 0.2 mBTC'].text(self.STATUS),
+                         "Local")
+
+    def test_a_local_swap_is_the_one_status_marked_in_red(self):
+        # It is the only one that is a problem rather than a wait, and the
+        # operator cannot tell it apart in Electrum's History tab.
+        from electrum.gui.qt.util import ColorScheme
+        tab, _ = self._make_history_tab([_row(), _local_row()])
+        by_label = self._by_label(tab)
+        local = by_label['⇄ Served reverse swap 0.2 mBTC']
+        settled = by_label['⇄ Served forward swap 0.2 mBTC']
+        self.assertEqual(local.foreground(self.STATUS).color(),
+                         ColorScheme.RED.as_color())
+        self.assertNotEqual(settled.foreground(self.STATUS).color(),
+                            ColorScheme.RED.as_color())
+
+    def test_the_four_silences_in_the_return_column_read_differently(self):
+        # A swap that has not settled, one of the operator's own, and one with a
+        # missing leg are three different things; printing "—" for all of them
+        # would hide which one the operator is looking at.
+        rows = [_row(), _own_row(),
+                _incomplete_row(payment_hash='dd' * 32,
+                                label='⇄ Served forward swap 0.3 mBTC'),
+                _local_row()]
+        tab, _ = self._make_history_tab(rows)
+        returns = {item.text(self.LABEL): item.text(self.RETURN)
+                   for item in self._top_items(tab)}
+        self.assertEqual(len(returns), 4, returns)
+        self.assertEqual(returns['⇄ Served forward swap 0.2 mBTC'], "205 sat")
+        self.assertEqual(returns['↪ My reverse swap 0.2 mBTC'], "— own swap")
+        self.assertEqual(returns['⇄ Served reverse swap 0.2 mBTC'], "—")
+        self.assertEqual(returns['⇄ Served forward swap 0.3 mBTC'], "— incomplete")
+
+    def test_a_swap_with_no_date_prints_a_dash_not_1970(self):
+        tab, _ = self._make_history_tab([_row(date='', status=SwapStatus.IN_FLIGHT)])
+        self.assertEqual(self._top_items(tab)[0].text(self.DATE), "—")
+
+    def test_components_say_whose_leg_they_are(self):
+        tab, _ = self._make_history_tab([_row()])
+        item = self._top_items(tab)[0]
+        locations = {item.child(i).text(self.LABEL): item.child(i).text(self.STATUS)
+                     for i in range(item.childCount())}
+        self.assertEqual(locations["Claim transaction"], "in this wallet")
+        self.assertEqual(locations["Funding transaction"], "the taker's")
+
+    def test_a_missing_leg_of_ours_reads_differently_from_the_takers(self):
+        tab, _ = self._make_history_tab([_incomplete_row()])
+        item = self._top_items(tab)[0]
+        locations = {item.child(i).text(self.LABEL): item.child(i).text(self.STATUS)
+                     for i in range(item.childCount())}
+        self.assertEqual(locations["Lightning payment"], "missing")
+        self.assertEqual(locations["Funding transaction"], "the taker's")
+
+    # ------------------------------------------------------------- the totals
+    def test_the_summary_counts_own_swaps_in_and_says_so(self):
+        tab, _ = self._make_history_tab([_row(), _own_row()])
+        text = tab.summary_label.text()
+        self.assertNotIn("Swaps served:", text)
+        self.assertIn("served and own", text)
+
+    def test_the_summary_leaves_an_unsettled_swap_out_of_the_return(self):
+        tab, _ = self._make_history_tab([_row(), _local_row()])
+        text = tab.summary_label.text()
+        self.assertIn("205 sat", text)          # only the settled one
+        self.assertIn("1 not settled yet", text)
+
+    def test_a_local_row_explains_itself_in_its_tooltip(self):
+        tab, _ = self._make_history_tab([_local_row()])
+        tip = self._top_items(tab)[0].toolTip(self.LABEL)
+        self.assertIn("never broadcast", tip)
+
+    # --------------------------------------------------------- interaction
+    def test_double_clicking_a_component_goes_to_the_history_tab(self):
+        tab, _ = self._make_history_tab([_row()])
+        item = self._top_items(tab)[0]
+        claim = [item.child(i) for i in range(item.childCount())
+                 if item.child(i).text(self.LABEL) == "Claim transaction"][0]
+        with mock.patch("swapserver_gui.qt.show_in_history",
+                        return_value=True) as go:
+            tab.on_item_activated(claim, 0)
+        go.assert_called_once()
+        self.assertEqual(go.call_args.kwargs["txid"], "tx_claim")
+
+    def test_double_clicking_the_takers_leg_does_nothing(self):
+        tab, _ = self._make_history_tab([_row()])
+        item = self._top_items(tab)[0]
+        theirs = [item.child(i) for i in range(item.childCount())
+                  if item.child(i).text(self.LABEL) == "Funding transaction"][0]
+        with mock.patch("swapserver_gui.qt.show_in_history") as go:
+            tab.on_item_activated(theirs, 0)
+        go.assert_not_called()
+
+    def test_double_clicking_a_swap_opens_its_detail_window(self):
+        tab, _ = self._make_history_tab([_row()])
+        item = self._top_items(tab)[0]
+        tab.on_item_activated(item, 0)
+        self.assertEqual(len(tab._detail_dialogs), 1)
+        dialog = tab._detail_dialogs[0]
+        self.addCleanup(dialog.deleteLater)
+        self.assertEqual(dialog.row.payment_hash, 'aa' * 32)
+
+    def test_a_refresh_keeps_the_row_the_operator_expanded_open(self):
+        # The table rebuilds itself every few seconds; collapsing the row being
+        # read would make the components unreachable in practice.
+        rows = [_row()]
+        tab, _ = self._make_history_tab(rows)
+        self._top_items(tab)[0].setExpanded(True)
+        with mock.patch("swapserver_gui.qt.build_swap_rows", return_value=rows):
+            tab.refresh()
+        self.assertTrue(self._top_items(tab)[0].isExpanded())
+
+    def test_a_failing_builder_leaves_the_last_good_table_alone(self):
+        tab, _ = self._make_history_tab([_row()])
+        with mock.patch("swapserver_gui.qt.build_swap_rows",
+                        side_effect=RuntimeError("wallet went away")):
+            tab.refresh()  # must not raise
+        self.assertEqual(len(self._top_items(tab)), 1)
+
+    def test_clean_up_stops_the_timer(self):
+        tab, _ = self._make_history_tab([_row()])
+        self.assertTrue(tab._timer.isActive())
+        tab.clean_up()
+        self.assertIsNone(tab._timer)
+        tab.clean_up()  # idempotent
+
+
+@unittest.skipUnless(HAVE_QT, "PyQt6 not installed")
+class TabRegistrationTests(_TabHarness, unittest.TestCase):
+    """Both tabs go in, both come out, and Electrum's History tab is untouched."""
+
+    def _plugin_with_window(self):
+        from swapserver_gui import qt as qt_mod
+        config = _Config()
+        plugin = qt_mod.Plugin(mock.MagicMock(), config, "swapserver_gui")
+        plugin.request_pairs_update = lambda: None
+        wallet = mock.MagicMock()
+        wallet.lnworker.swap_manager = _SwapManager()
+        wallet.lnworker.nostr_keypair = mock.Mock(pubkey=PUBKEY_33)
+        wallet.lnworker.num_sats_can_send.return_value = 0
+        wallet.lnworker.num_sats_can_receive.return_value = 0
+        wallet.has_password.return_value = False
+        wallet.get_full_history.return_value = {}
+        window = mock.MagicMock()
+        window.wallet = wallet
+        window.config = config
+        window.tabs = QTabWidget()
+        self.addCleanup(window.tabs.deleteLater)
+        return plugin, window
+
+    def test_both_tabs_are_added(self):
+        plugin, window = self._plugin_with_window()
+        plugin.bind_wallet(window.wallet)
+        plugin._add_tab(window)
+        self.addCleanup(plugin._remove_tab)
+        titles = [window.tabs.tabText(i) for i in range(window.tabs.count())]
+        self.assertEqual(titles, ["Swap Server", "History (Swaps)"])
+
+    def test_removing_takes_both_out_and_stops_both_timers(self):
+        plugin, window = self._plugin_with_window()
+        plugin.bind_wallet(window.wallet)
+        plugin._add_tab(window)
+        history_tab = plugin._history_tab
+        plugin._remove_tab()
+        self.assertEqual(window.tabs.count(), 0)
+        self.assertIsNone(plugin._history_tab)
+        self.assertIsNone(history_tab._timer)
+
+    def test_binding_a_wallet_does_not_touch_electrums_history(self):
+        # This plugin used to wrap SwapManager.get_groups_for_onchain_history in
+        # order to rewrite rows in Electrum's own History tab. It must not any
+        # more: that tab is upstream's, and reorganising it is this plugin's
+        # "History (Swaps)" tab's job.
+        plugin, window = self._plugin_with_window()
+        sm = window.wallet.lnworker.swap_manager
+        before = dict(sm.__dict__)
+        plugin.bind_wallet(window.wallet)
+        self.addCleanup(plugin.unbind_wallet)
+        self.assertEqual(dict(sm.__dict__), before)
+        self.assertFalse(hasattr(sm, 'get_groups_for_onchain_history'))
 
 
 if __name__ == '__main__':

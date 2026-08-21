@@ -26,6 +26,17 @@ From the tab you can:
     taker's filter must match, and a one-click **discoverability check**. See
     [Why can nobody see my swap server?](#why-can-nobody-see-my-swap-server)
 
+The plugin also adds a second top-level tab:
+
+- **History (Swaps)** — your wallet's history reorganised per swap instead of
+  per transaction: one row per swap, its components expandable underneath,
+  **double-click a component** to jump to it in Electrum's History tab. Unlike
+  the Status table this one includes the swaps you made as a customer and the
+  ones that have not settled, each marked with its status — including `Local`,
+  the batch that was never broadcast. Electrum's own History tab is left
+  **exactly** as upstream renders it. See
+  [the History (Swaps) tab](#the-history-swaps-tab-and-why-electrums-history-tab-is-left-alone).
+
 The server runs two independent transports (either or both):
 
 - **HTTP** — an aiohttp endpoint on `localhost:<port>` (`/getpairs`,
@@ -156,10 +167,10 @@ plugins/swapserver_gui/
   __init__.py          # registers plugins.swapserver_gui.autostart
   _version.py          # plugin version, stamped from the git tag at build time
   swapserver_gui.py    # GUI-agnostic server lifecycle
-  served_swaps.py      # served-vs-own classifier, per-swap rows, history labels
+  served_swaps.py      # served-vs-own classifier, per-swap rows, swap status
   pow.py               # cancel-safe, resumable announcement proof-of-work
   nostr_check.py       # nostr identity + the discoverability rule engine/check
-  qt.py                # the "Swap Server" tab + Plugin(load_wallet/close_wallet)
+  qt.py                # "Swap Server" + "History (Swaps)" tabs + Plugin hooks
 tests/                 # unit + HTTP/nostr/Qt end-to-end tests
 contrib/make_zip.sh    # build the external-plugin zip
 contrib/regtest_demo/  # one-command local regtest + nostr demo
@@ -241,17 +252,22 @@ ELECTRUM_SRC=/path/to/electrum python3 -m unittest discover -s tests -v
   crowded out, unreachable) is asserted to be named correctly.
 - `tests/test_served_swaps.py` — the served-vs-own classifier, the recorded
   ledger, one-row-per-swap assembly, the batch mining-fee split (including that
-  the shares always add back up), and the history labels.
+  the shares always add back up), the swap labels, and the status each height
+  maps to (a never-broadcast spend is `Local`, and never counts).
 - `tests/test_served_swaps_e2e.py` — a taker requests swaps over the **real**
   HTTP endpoint against Electrum's **real** `SwapManager` on a **real**
   `WalletDB`; asserts only those reach the history, that a swap is one row with
   all of its legs, that a batched claim is split per swap, that the real group
-  builder comes back relabelled by role, and that the classification survives
-  dumping and reloading the wallet file.
-- `tests/test_qt_tab.py` — builds the real `SwapServerTab` on Qt's offscreen
-  platform and drives `refresh()`, opens the component window, and drives the
-  jump into a real `CustomModel` history tree. **Skips when PyQt6 is not
-  installed**; CI installs it so these run there.
+  builder comes back **unmodified** (Electrum's History tab is upstream's), that
+  a batch stranded as a local transaction is reported as `Local` rather than
+  counted as served, and that the classification survives dumping and reloading
+  the wallet file.
+- `tests/test_qt_tab.py` — builds the real `SwapServerTab` and the real
+  `SwapHistoryTab` on Qt's offscreen platform and drives `refresh()`, opens the
+  component window, drives the jump into a real `CustomModel` history tree, and
+  asserts both tabs are registered and that binding a wallet leaves the swap
+  manager untouched. **Skips when PyQt6 is not installed**; CI installs it so
+  these run there.
 
 ### A note on which swaps are counted
 
@@ -331,18 +347,28 @@ preimage, redeem script — a funding output is 43 bytes). The shares are comput
 by largest remainder so they sum back to the fee **exactly**, which is what
 makes the rows reconcile against the wallet's own delta for the transaction.
 
-### A note on the History tab
+### The History (Swaps) tab, and why Electrum's History tab is left alone
 
-`history_list.py` has no `run_hook` anywhere, so a plugin cannot add a column or
-an icon to Electrum's History tab. What it *can* do is name the rows, which is
-also the part that was actively misleading: upstream labels a swap after
+Electrum's History tab is transaction-shaped, and a swap is not a transaction:
+it is a lightning payment, sometimes a mining-fee prepayment, a funding
+transaction, and a claim or refund transaction. The wallet's history scatters
+those across a group — or collapses the group into a single leg, or merges two
+swaps that shared a batch transaction. Reading a swap out of it is work.
+
+This plugin used to do that work *in place*: it wrapped
+`SwapManager.get_groups_for_onchain_history` on the instance and rewrote the
+group labels to say the role out loud, because upstream labels a swap after
 `SwapData.is_reverse`, and that flag is stored from the point of view of
-whoever stored it. `server_create_normal_swap` — the handler for a taker's
-**forward** swap — calls `create_reverse_swap`, so a forward swap you served
+whoever stored it — `server_create_normal_swap`, the handler for a taker's
+**forward** swap, calls `create_reverse_swap`, so a forward swap you served
 reads "Reverse swap" in your own history.
 
-The plugin wraps `SwapManager.get_groups_for_onchain_history` on the instance
-and rewrites the group labels to say the role out loud:
+It no longer does. **Electrum's History tab now renders exactly as upstream
+renders it**, confusing label and all; nothing here wraps the group builder or
+writes to the wallet. The reorganised view lives in a tab of its own instead:
+
+**History (Swaps)** — one top-level row per swap, the components it is made of
+underneath it, and a value that is that swap's own:
 
 | | |
 |---|---|
@@ -350,23 +376,45 @@ and rewrites the group labels to say the role out loud:
 | `↪ My forward swap 0.1 mBTC` | initiated by you as a customer |
 | `⇄? Unattributed forward swap 0.2 mBTC` | the records do not say which |
 
-Wrapping is necessary rather than tidy: that method both builds the mapping and
-re-applies the labels it carries on every history refresh, so a label written
-once would be overwritten within seconds. The per-leg labels ("Funding
-transaction", "Claim transaction") are normally left alone — they are the
-component names, and the component window uses the same ones. The leading word
-is what the History tab's search box filters on, and it survives CSV export. The
-wrapper is installed for as long as a wallet is bound, not just while the server
-runs, and is removed when the wallet closes or the plugin is disabled.
+Unlike the Swap Server tab's table, this one lists your own swaps beside the
+served ones, and unsettled swaps beside the settled ones — a swap you can see in
+the History tab should never be missing from the swap-shaped view of that same
+history. Only served, settled, complete swaps contribute to the net return
+(`ServedSwapRow.counts_towards_total`); everything left out is counted out loud
+under the total rather than silently dropped.
 
-There is one case where the leg label has to be rewritten too. A group with a
-single member never survives to be expanded — `get_full_history` replaces it by
-that member, which is displayed under the **leg** label, so the group label (and
-with it everything the wrapper does) never reaches the screen. A swap whose
-lightning payment is missing from the wallet has only its on-chain leg, and so
-appears in the History tab as a bare "Claim transaction" belonging to no visible
-swap. When a group is going to collapse, the wrapper names the leg after the
-swap instead.
+Double-clicking a component jumps to that leg in Electrum's History tab, which
+is what makes leaving that tab untouched workable: it is still where a
+transaction is inspected, this tab is where a *swap* is.
+
+### Swap status, and the "Local" transaction that will not go away
+
+Each row carries a `SwapStatus`, decided by the transaction that ends the swap:
+
+| | |
+|---|---|
+| `Confirmed` | the spending tx confirmed; the swap is over and it counts |
+| `Unconfirmed` | in the mempool; it will settle on the next block |
+| `In flight` | the lockup is unspent, or the spend is timelocked |
+| `Local` | **the spending tx is in the wallet but was never broadcast** |
+
+The last one is worth its own name. `TxBatch.run_iteration`
+(`electrum/txbatcher.py`) adds every batch transaction to the wallet as local
+*before* broadcasting it, in order to reserve its UTXOs. If the broadcast fails
+and there is no base transaction to fall back on, it deliberately keeps it —
+"it is dangerous to remove the transaction... it might have been broadcast" —
+and the only retry lives in `find_base_tx`, which returns early once
+`self._prevout` is unset. So a batch stranded that way is never rebroadcast and
+never removed, and sits in the History tab as a "Local" row indefinitely.
+
+That is upstream's behaviour, not this plugin's: nothing here creates,
+broadcasts or removes transactions. What this plugin owes you is not to make it
+worse. The old relabeller had no confirmation gate, so it dressed such a
+transaction up as `⇄ Served … swap N sat` in the History tab while the Swap
+Server tab — which *does* gate on height — left it out of the count, and the two
+views disagreed about the same swap. Now the History tab does not describe it at
+all, and the History (Swaps) tab names it `Local`, marks it red, explains the
+stranded-batch case in its tooltip, and keeps it out of the net return.
 
 ### A note on the HTTP port
 

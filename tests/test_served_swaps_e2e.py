@@ -44,8 +44,12 @@ from electrum.submarine_swaps import SwapManager  # noqa: E402
 from electrum.wallet_db import WalletDB  # noqa: E402
 
 from swapserver_gui.swapserver_gui import (  # noqa: E402
-    ComponentKind, SERVED_SWAPS_DB_KEY, SwapServerGuiPlugin,
-    build_served_swap_rows, get_swap_summary, served_swaps_ledger,
+    ComponentKind, SERVED_SWAPS_DB_KEY, SwapServerGuiPlugin, SwapStatus,
+    build_served_swap_rows, build_swap_rows, get_swap_summary,
+    served_swaps_ledger,
+)
+from swapserver_gui.served_swaps import (  # noqa: E402
+    OWN_LABEL_MARK, SERVED_LABEL_MARK,
 )
 
 THEIR_PUBKEY = bytes.fromhex('02' + '11' * 32)  # the taker's key, we only embed it
@@ -105,8 +109,8 @@ def _make_wallet(db: WalletDB, config: _Config) -> Any:
     wallet.lnworker.has_payment_bundle.return_value = False
     # What get_full_history will find to group the on-chain legs with. Empty by
     # default; a test that cares sets it, because whether a swap group has a
-    # lightning member decides whether the group survives to be expanded (see
-    # relabel_swap_history_groups).
+    # lightning member decides whether upstream's group survives to be expanded
+    # in Electrum's own History tab.
     wallet.lnworker.get_lightning_history.return_value = {}
     return wallet
 
@@ -372,8 +376,18 @@ class ServedSwapsE2ETest(unittest.TestCase):
         self.assertEqual([c.in_wallet for c in rows[0].components],
                          [True, True, True, False])
 
-    def test_history_groups_are_relabelled_by_role(self) -> None:
-        """The real SwapManager's group builder, through our wrapper."""
+    def test_electrums_own_history_labels_are_left_untouched(self) -> None:
+        """Electrum's History tab is upstream's again, against the real builder.
+
+        This plugin used to wrap
+        ``SwapManager.get_groups_for_onchain_history`` so that swap rows in
+        Electrum's own History tab would say which side of the swap we were on.
+        Reorganising that history is now the "History (Swaps)" tab's job, and
+        the History tab has to render exactly as upstream renders it --
+        including upstream's own confusing name for a served forward swap
+        ("Reverse swap", after *our* copy's is_reverse flag), which is not this
+        plugin's to correct in someone else's tab.
+        """
         self._start_server()
         served_forward = self._serve_taker_forward_swap()
         own_forward = self._own_forward_swap()
@@ -382,45 +396,57 @@ class ServedSwapsE2ETest(unittest.TestCase):
         # upstream reads the spending tx back to look for a preimage; there is
         # no chain here, so tell it there is no such transaction.
         self.wallet.lnworker.lnwatcher.adb.get_transaction.return_value = None
-        # both swaps paid/were paid over lightning, so both groups have a
-        # lightning member and neither will be collapsed into its leg
         self.wallet.lnworker.get_lightning_history.return_value = {
             served_forward: None, own_forward: None}
 
-        groups = self.sm.get_groups_for_onchain_history()
-        labels = {txid: entry['group_label'] for txid, entry in groups.items()}
-        # Upstream names swaps after *our* copy's is_reverse flag, so it calls a
-        # served forward swap a "Reverse swap". Say whose swap it was instead.
-        self.assertIn('Served forward swap', labels['tx_claim'])
-        self.assertIn('My forward swap', labels['tx_own_funding'])
-        # the per-leg labels are the component names and stay as upstream set them
-        self.assertEqual(groups['tx_claim']['label'], 'Claim transaction')
-
-        # ...and closing the wallet puts upstream's own method back.
-        self.plugin.unbind_wallet()
+        # Nothing of ours is hung on the swap manager, even though the plugin is
+        # bound to the wallet and the server is running...
         self.assertNotIn('get_groups_for_onchain_history', self.sm.__dict__)
         groups = self.sm.get_groups_for_onchain_history()
+
+        # ...so upstream's labels come through untouched, marks and all.
         self.assertIn('Reverse swap', groups['tx_claim']['group_label'])
+        self.assertEqual(groups['tx_claim']['label'], 'Claim transaction')
+        for txid, entry in groups.items():
+            for key in ('label', 'group_label'):
+                self.assertNotIn(SERVED_LABEL_MARK, entry.get(key) or '',
+                                 f"{txid}.{key} was rewritten")
+                self.assertNotIn(OWN_LABEL_MARK, entry.get(key) or '',
+                                 f"{txid}.{key} was rewritten")
 
-    def test_a_swap_with_no_lightning_leg_is_named_on_its_claim_tx(self) -> None:
-        """The orphan "Claim transaction" case, against the real group builder.
+    def test_an_unbroadcast_batch_is_reported_as_local_not_as_served(self) -> None:
+        """The stranded-batch case, end to end.
 
-        With no lightning payment the group has a single member, and
-        ``get_full_history`` shows a single-member group as that member, under
-        its *leg* label -- so rewriting only ``group_label`` leaves the operator
-        looking at a bare "Claim transaction" that belongs to no visible swap.
+        ``TxBatch.run_iteration`` adds a batch transaction to the wallet before
+        broadcasting it and deliberately keeps it when the broadcast fails with
+        no base transaction to fall back on, and only retries while the batch is
+        still open -- so a batch can sit in the wallet as "Local" indefinitely.
+        Such a swap has not settled: it must not be counted as served, and the
+        Swaps history tab has to be able to name it rather than show it as a
+        swap that completed.
         """
-        self._start_server()
-        served_forward = self._serve_taker_forward_swap()
-        self._confirm(served_forward, funding='tx_f', spending='tx_claim')
-        self.wallet.lnworker.lnwatcher.adb.get_transaction.return_value = None
-        self.wallet.lnworker.get_lightning_history.return_value = {}
+        from electrum.address_synchronizer import TX_HEIGHT_LOCAL
 
-        groups = self.sm.get_groups_for_onchain_history()
-        self.assertIn('Served forward swap', groups['tx_claim']['group_label'])
-        # the label that will actually be displayed
-        self.assertIn('Served forward swap', groups['tx_claim']['label'])
-        self.assertNotIn('Claim transaction', groups['tx_claim']['label'])
+        self._start_server()
+        served = self._serve_taker_reverse_swap()
+        self._confirm(served, funding='tx_fund', spending='tx_spend')
+        self.wallet.lnworker.lnwatcher.adb.get_transaction.return_value = None
+        # the spending tx is in the wallet but never made it to the network
+        self.wallet.adb.get_tx_height.side_effect = lambda txid: _TxHeight(
+            TX_HEIGHT_LOCAL if txid == 'tx_spend' else 100)
+
+        # The Swap Server tab's population skips it, exactly as before.
+        self.assertEqual(build_served_swap_rows(self.wallet), [])
+
+        # The Swaps history tab shows it, named for what it is, and keeps it out
+        # of the net return.
+        rows = build_swap_rows(self.wallet, include_own=True, include_pending=True)
+        local = [row for row in rows if row.payment_hash == served]
+        self.assertEqual(len(local), 1, "the local swap is missing from the tab")
+        self.assertIs(local[0].status, SwapStatus.LOCAL)
+        self.assertFalse(local[0].counts_towards_total)
+        self.assertEqual(get_swap_summary(rows)['overall_return_sat'], 0)
+        self.assertEqual(get_swap_summary(rows)['num_pending'], 1)
 
     def test_classification_survives_a_wallet_file_round_trip(self) -> None:
         self._start_server()
