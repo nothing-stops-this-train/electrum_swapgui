@@ -23,18 +23,19 @@ From the tab you can:
     tab. Swaps you initiate yourself as a customer are **not** counted
     (see [which swaps are counted](#a-note-on-which-swaps-are-counted)).
   - **Diagnostics** — why the offer is or is not going out, the three values a
-    taker's filter must match, and a one-click **discoverability check**. See
+    taker's filter must match, a one-click **discoverability check**, and an
+    **export** of the whole transaction history for debugging. See
     [Why can nobody see my swap server?](#why-can-nobody-see-my-swap-server)
+    and [exporting the transaction
+    history](#exporting-the-transaction-history-for-debugging)
 
 The plugin also adds a second top-level tab:
 
-- **History (Swaps)** — your wallet's history reorganised per swap instead of
-  per transaction: one row per swap, its components expandable underneath,
-  **double-click a component** to jump to it in Electrum's History tab. Unlike
-  the Status table this one includes the swaps you made as a customer and the
-  ones that have not settled, each marked with its status — including `Local`,
-  the batch that was never broadcast. Electrum's own History tab is left
-  **exactly** as upstream renders it. See
+- **History (Swaps)** — a second copy of Electrum's History tab, identical to it
+  in every way (same columns, grouping, date filter, summary, export, right-click
+  menu) except that each swap row says which side of the swap you were on:
+  `⇄ Served forward swap 0.2 mBTC` rather than upstream's `Reverse swap 0.2 mBTC`.
+  Electrum's own History tab is left **exactly** as upstream renders it. See
   [the History (Swaps) tab](#the-history-swaps-tab-and-why-electrums-history-tab-is-left-alone).
 
 The server runs two independent transports (either or both):
@@ -167,7 +168,8 @@ plugins/swapserver_gui/
   __init__.py          # registers plugins.swapserver_gui.autostart
   _version.py          # plugin version, stamped from the git tag at build time
   swapserver_gui.py    # GUI-agnostic server lifecycle
-  served_swaps.py      # served-vs-own classifier, per-swap rows, swap status
+  served_swaps.py      # served-vs-own classifier, per-swap rows, swap labels
+  history_export.py    # the diagnostics export: all of the history, as json
   pow.py               # cancel-safe, resumable announcement proof-of-work
   nostr_check.py       # nostr identity + the discoverability rule engine/check
   qt.py                # "Swap Server" + "History (Swaps)" tabs + Plugin hooks
@@ -252,22 +254,33 @@ ELECTRUM_SRC=/path/to/electrum python3 -m unittest discover -s tests -v
   crowded out, unreachable) is asserted to be named correctly.
 - `tests/test_served_swaps.py` — the served-vs-own classifier, the recorded
   ledger, one-row-per-swap assembly, the batch mining-fee split (including that
-  the shares always add back up), the swap labels, and the status each height
-  maps to (a never-broadcast spend is `Local`, and never counts).
+  the shares always add back up), the swap labels, the relabelling of a history
+  copy (group rows, collapsed groups, and a label you typed yourself winning),
+  and the status each height maps to (a never-broadcast spend is `Local`, and
+  never counts).
 - `tests/test_served_swaps_e2e.py` — a taker requests swaps over the **real**
   HTTP endpoint against Electrum's **real** `SwapManager` on a **real**
   `WalletDB`; asserts only those reach the history, that a swap is one row with
   all of its legs, that a batched claim is split per swap, that the real group
   builder comes back **unmodified** (Electrum's History tab is upstream's), that
   a batch stranded as a local transaction is reported as `Local` rather than
-  counted as served, and that the classification survives dumping and reloading
-  the wallet file.
+  counted as served, that the classification survives dumping and reloading the
+  wallet file, that the swap relabel names the side we were on without writing
+  anything back, and that a diagnostics export of real swaps carries their
+  records but none of their real keys.
+- `tests/test_history_export.py` — the diagnostics export: that the entries
+  Electrum's own export drops (unconfirmed, local, no timestamp) are all there,
+  that the raw hex rules hold, that a section which raises costs that section
+  only, and that no swap secret reaches the encoded file.
 - `tests/test_qt_tab.py` — builds the real `SwapServerTab` and the real
-  `SwapHistoryTab` on Qt's offscreen platform and drives `refresh()`, opens the
-  component window, drives the jump into a real `CustomModel` history tree, and
-  asserts both tabs are registered and that binding a wallet leaves the swap
-  manager untouched. **Skips when PyQt6 is not installed**; CI installs it so
-  these run there.
+  `SwapHistoryTab` — the latter out of upstream's own `HistoryList` and
+  `HistoryModel` — on Qt's offscreen platform and drives `refresh()`: the swap
+  rows are relabelled, the wallet is handed back exactly as it was, a relabel
+  that fails still renders the history, a hidden tab does not rebuild it, and
+  the export button writes a real file. Also opens the component window, drives
+  the jump into a real `CustomModel` history tree, and asserts both tabs are
+  registered. **Skips when PyQt6 is not installed**; CI installs it so these run
+  there.
 
 ### A note on which swaps are counted
 
@@ -349,26 +362,23 @@ makes the rows reconcile against the wallet's own delta for the transaction.
 
 ### The History (Swaps) tab, and why Electrum's History tab is left alone
 
-Electrum's History tab is transaction-shaped, and a swap is not a transaction:
-it is a lightning payment, sometimes a mining-fee prepayment, a funding
-transaction, and a claim or refund transaction. The wallet's history scatters
-those across a group — or collapses the group into a single leg, or merges two
-swaps that shared a batch transaction. Reading a swap out of it is work.
+Upstream labels a swap after `SwapData.is_reverse`, and that flag is stored from
+the point of view of whoever stored it: `server_create_normal_swap`, the handler
+for a taker's **forward** swap, calls `create_reverse_swap`. So a forward swap
+you served reads "Reverse swap" in your own history, and a swap you made as a
+customer reads exactly like one you served.
 
-This plugin used to do that work *in place*: it wrapped
-`SwapManager.get_groups_for_onchain_history` on the instance and rewrote the
-group labels to say the role out loud, because upstream labels a swap after
-`SwapData.is_reverse`, and that flag is stored from the point of view of
-whoever stored it — `server_create_normal_swap`, the handler for a taker's
-**forward** swap, calls `create_reverse_swap`, so a forward swap you served
-reads "Reverse swap" in your own history.
+Saying so is useful. Saying so *in Electrum's History tab* is not this plugin's
+call — that tab is upstream's, and an operator has to be able to trust that what
+it shows is what Electrum shows. Both are available here, because the plugin
+adds a **second copy of the History tab** and relabels the swaps in that one:
 
-It no longer does. **Electrum's History tab now renders exactly as upstream
-renders it**, confusing label and all; nothing here wraps the group builder or
-writes to the wallet. The reorganised view lives in a tab of its own instead:
+| tab | swap rows read |
+|---|---|
+| **History** (Electrum's) | `Reverse swap 0.2 mBTC` — upstream, untouched |
+| **History (Swaps)** (this plugin's) | `⇄ Served forward swap 0.2 mBTC` |
 
-**History (Swaps)** — one top-level row per swap, the components it is made of
-underneath it, and a value that is that swap's own:
+The three labels:
 
 | | |
 |---|---|
@@ -376,20 +386,44 @@ underneath it, and a value that is that swap's own:
 | `↪ My forward swap 0.1 mBTC` | initiated by you as a customer |
 | `⇄? Unattributed forward swap 0.2 mBTC` | the records do not say which |
 
-Unlike the Swap Server tab's table, this one lists your own swaps beside the
-served ones, and unsettled swaps beside the settled ones — a swap you can see in
-the History tab should never be missing from the swap-shaped view of that same
-history. Only served, settled, complete swaps contribute to the net return
-(`ServedSwapRow.counts_towards_total`); everything left out is counted out loud
-under the total rather than silently dropped.
+Everything else in the tab is Electrum's, because it *is* Electrum's: the same
+`HistoryList` over the same `HistoryModel`, so the date filter, the summary, the
+CSV/JSON export, the right-click menu, editing a description and double-clicking
+for the transaction dialog all work exactly as they do in the tab it copies. The
+group a swap forms keeps its legs underneath it ("Funding transaction", "Claim
+transaction"), and a row that is not a swap is left alone.
 
-Double-clicking a component jumps to that leg in Electrum's History tab, which
-is what makes leaving that tab untouched workable: it is still where a
-transaction is inspected, this tab is where a *swap* is.
+**How the copy stays a copy.** The plugin used to wrap
+`SwapManager.get_groups_for_onchain_history` on the instance. That method's
+labels are written into the wallet by `LNWallet.get_groups_for_onchain_history`
+(`wallet.set_group_label`), which is why the rewrite showed up in Electrum's own
+History tab — there is only one wallet, and both tabs read it. So the relabel
+happens on the *result* of `wallet.get_full_history` instead, for the duration of
+this model's refresh only (`qt.swap_labels_for`), and **nothing is written to the
+wallet at all**. A label you typed yourself still wins, as it does everywhere
+else in Electrum.
+
+One case needs care: `get_full_history` replaces a group of one by its single
+member (`if len(children) == 1: transactions[key] = children[0]`), so the group
+label never reaches the screen. That is what a swap whose lightning payment is
+missing from the wallet looks like — on-chain leg alone, group of one, collapsed
+— and it is why such a swap used to show up as a bare "Claim transaction" with no
+swap row anywhere. When the group has collapsed, the leg row is relabelled
+instead.
+
+The tab rebuilds itself every 4s, and a rebuild while it is off screen costs
+nothing: `MyTreeView.maybe_defer_update` defers it and marks the view stale, and
+upstream's `showEvent` refreshes it when you switch back.
+
+The Diagnostics pane scrolls, since it is now the tall one: without that its
+last group is squeezed below its own minimum height and its wrapped text is
+clipped rather than merely made narrower.
 
 ### Swap status, and the "Local" transaction that will not go away
 
-Each row carries a `SwapStatus`, decided by the transaction that ends the swap:
+Every swap row this plugin builds carries a `SwapStatus`, decided by the
+transaction that ends the swap. It is what the Swap Server tab's table gates on,
+and it travels with each swap in the diagnostics export:
 
 | | |
 |---|---|
@@ -405,16 +439,51 @@ and there is no base transaction to fall back on, it deliberately keeps it —
 "it is dangerous to remove the transaction... it might have been broadcast" —
 and the only retry lives in `find_base_tx`, which returns early once
 `self._prevout` is unset. So a batch stranded that way is never rebroadcast and
-never removed, and sits in the History tab as a "Local" row indefinitely.
+never removed, and sits in the History tab as a "Local" row indefinitely (which
+is also how Electrum's own status column names it, in both History tabs).
 
 That is upstream's behaviour, not this plugin's: nothing here creates,
 broadcasts or removes transactions. What this plugin owes you is not to make it
-worse. The old relabeller had no confirmation gate, so it dressed such a
-transaction up as `⇄ Served … swap N sat` in the History tab while the Swap
-Server tab — which *does* gate on height — left it out of the count, and the two
-views disagreed about the same swap. Now the History tab does not describe it at
-all, and the History (Swaps) tab names it `Local`, marks it red, explains the
-stranded-batch case in its tooltip, and keeps it out of the net return.
+worse — an unsettled swap must not be counted as revenue. It is left out of the
+net return, and `history_export.py` writes it out with `is_local: true` and its
+raw hex, which is the state most worth sending to someone else. If it does not
+clear, the usual remedy is to remove the local transaction from the History tab
+so its inputs are freed.
+
+### Exporting the transaction history for debugging
+
+The Diagnostics sub-tab has an **Export** section that writes the whole of this
+wallet's transaction history to one json file.
+
+This is deliberately not Electrum's own history export. That one
+(`Abstract_Wallet.export_history_to_file`) drops every entry with no timestamp —
+"remove unconfirmed/local tx as their ordering is not deterministic, and they
+don't seem useful for a wallet export" — which is exactly backwards for
+debugging: a swap that is stuck is stuck *because* of a transaction that never
+confirmed, and the stranded local batch above has no timestamp at all. Nothing
+is dropped here.
+
+What goes in the file:
+
+| section | |
+|---|---|
+| `history` | every `get_full_history` entry, groups and children intact, unconfirmed and local included |
+| `transactions` | every transaction the wallet holds: height, confirmations, inputs, outputs, `is_local` |
+| `swaps` | the `SwapData` records: both legs, lockup address, timelock, amounts, role, status |
+| `swap_rows` | this plugin's own reading of the same swaps, components and all |
+| `lightning_history`, `channels` | the payment legs and the channels they went through |
+| `labels` | yours and the generated ones, kept apart |
+| `server` | the announcement/server state at the moment of export |
+
+The raw hex of anything **not confirmed** is always included, because nothing
+else has a copy of it. For confirmed transactions it is opt-in (a checkbox):
+they can be fetched from any block explorer, and their hex is what makes the
+file large.
+
+**Secrets are not exported.** `privkey` and `preimage` are replaced by a
+truncated sha256 fingerprint — enough to tell two records apart or confirm that
+two hold the same secret, not enough to spend anything. The file still describes
+your addresses, labels and transactions in full, so treat it as private.
 
 ### A note on the HTTP port
 

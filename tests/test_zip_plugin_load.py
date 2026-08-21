@@ -180,12 +180,20 @@ class ExternalZipLoadTests(_ZipBuildMixin, unittest.TestCase):
     def test_non_gui_submodules_import_from_zip(self) -> None:
         """The regression test: this is the import that crashed the install."""
         r = self.run_child(self._loader("""
-            for sub in ('pow', 'nostr_check', 'swapserver_gui'):
+            for sub in ('pow', 'nostr_check', 'swapserver_gui', 'history_export'):
                 full = BASE + '.' + sub
                 spec = importlib.util.find_spec(full)
                 assert spec is not None, full
                 exec_module_from_spec(spec, full)
             core = sys.modules[BASE + '.swapserver_gui']
+            # history_export reaches for two package-relative things: its
+            # sibling served_swaps (a 'from .x import y') and _version (an
+            # importlib.import_module), which are the two forms that break
+            # differently when the package name is not the sys.modules key.
+            export = sys.modules[BASE + '.history_export']
+            assert export.SCHEMA_VERSION >= 1
+            assert export.REDACTED_SWAP_FIELDS
+            assert export._version.__version__
             # the module handle must be the *same* module object, not a re-import
             assert core.swap_pow is sys.modules[BASE + '.pow'], core.swap_pow
             assert core.swap_pow.pow_bits(bytes(32), 1) >= 0
@@ -210,6 +218,7 @@ class ExternalZipLoadTests(_ZipBuildMixin, unittest.TestCase):
                 mod = exec_module_from_spec(spec, full)
                 assert mod.swap_pow is sys.modules[BASE + '.pow']
                 assert mod.nostr_check is sys.modules[BASE + '.nostr_check']
+                assert mod.history_export is sys.modules[BASE + '.history_export']
                 assert issubclass(mod.Plugin, sys.modules[BASE + '.swapserver_gui'].SwapServerGuiPlugin)
                 print('OK (executed)')
         """))

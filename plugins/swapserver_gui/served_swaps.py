@@ -372,40 +372,6 @@ class SwapStatus(Enum):
         return self is SwapStatus.FINAL
 
 
-#: Human-readable status text, for the Swaps history tab's Status column.
-_SWAP_STATUS_LABELS: Dict['SwapStatus', str] = {}
-
-
-def format_swap_status(status: 'SwapStatus') -> str:
-    """One word (or two) for the Status column."""
-    if not _SWAP_STATUS_LABELS:  # built lazily so _() runs after i18n is set up
-        _SWAP_STATUS_LABELS.update({
-            SwapStatus.FINAL: _("Confirmed"),
-            SwapStatus.UNCONFIRMED: _("Unconfirmed"),
-            SwapStatus.LOCAL: _("Local"),
-            SwapStatus.IN_FLIGHT: _("In flight"),
-        })
-    return _SWAP_STATUS_LABELS.get(status, str(status.value))
-
-
-def format_local_note() -> str:
-    """Why a "Local" row is not a swap that was served.
-
-    Worth spelling out: the operator sees this row in Electrum's History tab
-    too, where nothing distinguishes it from a settled swap, and its most
-    likely cause is a batch that was never broadcast rather than anything the
-    taker did.
-    """
-    return _(
-        "The transaction that would end this swap is in this wallet but was "
-        "never broadcast, so the swap has not settled.\nElectrum's transaction "
-        "batcher adds a batch to the wallet before broadcasting it and keeps it "
-        "as \"Local\" if the broadcast fails, and it only retries while the "
-        "batch is still open.\n\nIt is left out of the net return. If it does "
-        "not clear, the usual remedy is to remove the local transaction from "
-        "the History tab, so its inputs are freed.")
-
-
 def swap_status(wallet: 'Abstract_Wallet', swap: Any) -> 'SwapStatus':
     """Where ``swap`` stands, per the wallet's view of its spending tx.
 
@@ -986,6 +952,93 @@ def format_swap_label(
         text = _("Unattributed {kind}").format(kind=kind)
         mark = UNKNOWN_LABEL_MARK
     return f"{mark} {text} {amount_str}".rstrip()
+
+
+def _user_label(wallet: 'Abstract_Wallet', key: str) -> str:
+    """The label the *operator* typed for ``key``, if any.
+
+    ``Abstract_Wallet.get_label_for_txid`` merges two sources -- the labels the
+    operator set (``_labels``, saved in the wallet file) and the generated ones
+    upstream writes on every history refresh (``_default_labels``, in memory) --
+    and prefers the operator's.  :func:`relabel_swap_history_items` has to make
+    the same distinction, so it asks for one source rather than the merge.
+    """
+    try:
+        return wallet._get_label(key) or ''
+    except Exception:
+        return ''
+
+
+def relabel_swap_history_items(
+        wallet: 'Abstract_Wallet',
+        transactions: Dict[str, Any],
+        *,
+        sm: Optional['SwapManager'] = None,
+) -> Dict[str, Any]:
+    """Say which side of each swap we were on, in one copy of the history.
+
+    ``transactions`` is what ``Abstract_Wallet.get_full_history`` returns:
+    ``{key: tx_item}``, where a grouped transaction is keyed ``'group:' +
+    group_id`` and its members hang off ``tx_item['children']``.  A swap is
+    normally such a group, so the label rewritten here is the group's --
+    upstream builds it from ``SwapData.is_reverse``, which is stored from the
+    point of view of whoever stored it, and so calls a forward swap we served a
+    "Reverse swap" (see :func:`taker_did_forward_swap`).  The per-leg labels
+    ("Funding transaction", "Claim transaction") are left alone: they are the
+    component names, and are what the operator wants to read inside an expanded
+    group.
+
+    The exception is a group that never reaches the screen as a group.
+    ``get_full_history`` replaces a group of one by its single member (``if
+    len(children) == 1: transactions[key] = children[0]``), which is what a swap
+    whose lightning payment is missing from the wallet looks like: on-chain leg
+    alone, group of one, collapsed.  Its row is displayed under the *leg* label,
+    so that is the one rewritten -- unless the operator has labelled that
+    transaction themselves, in which case their label wins, exactly as it does
+    everywhere else in Electrum.
+
+    This mutates and returns ``transactions`` and writes nothing to the wallet.
+    That is the whole difference from the ``relabel_swap_history_groups`` this
+    replaces, which wrapped ``SwapManager.get_groups_for_onchain_history`` and
+    so relabelled Electrum's own History tab (via the ``set_group_label`` side
+    effect in ``LNWallet.get_groups_for_onchain_history``).  Rewriting the
+    result instead keeps the change to the copy of the history the caller asked
+    for -- the plugin's "History (Swaps)" tab -- and leaves Electrum's History
+    tab exactly as upstream renders it.
+    """
+    if sm is None:
+        lnworker = getattr(wallet, 'lnworker', None)
+        sm = getattr(lnworker, 'swap_manager', None) if lnworker else None
+    if sm is None:
+        return transactions
+    ledger = served_swaps_ledger(wallet)
+    for payment_hash, swap in list(sm._swaps.items()):
+        # The same group id upstream keys the swap's history group on
+        # (SwapManager.get_groups_for_onchain_history): the transaction of ours
+        # that the swap is anchored to.
+        group_id = swap.spending_txid if swap.is_reverse else swap.funding_txid
+        if not group_id:
+            continue
+        item = transactions.get('group:' + group_id)
+        if item is None:
+            # Not grouped at all: upstream only groups a transaction it has a
+            # group for, and only the ones in this wallet's history are here.
+            item = transactions.get(group_id)
+        if not isinstance(item, dict):
+            continue
+        role = classify_swap(swap, payment_hash, ledger)
+        label = format_swap_label(
+            role=role,
+            taker_is_forward=taker_did_forward_swap(
+                swap, served=role is not SwapRole.OWN),
+            is_submarine_payment=bool(getattr(swap, 'claim_to_output', None)),
+            amount_str=_format_amount(sm, swap_amount_sat(swap)),
+        )
+        if item.get('children'):
+            item['label'] = label  # the group row; its legs keep their names
+        elif not _user_label(wallet, item.get('txid') or ''):
+            item['label'] = label  # collapsed group: the leg row is the swap
+    return transactions
 
 
 # ---------------------------------------------------------------------------
