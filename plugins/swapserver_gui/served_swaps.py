@@ -48,10 +48,11 @@ import time
 from datetime import datetime
 from enum import Enum
 from typing import (TYPE_CHECKING, Any, Dict, Hashable, List, NamedTuple,
-                    Optional, Sequence, Set, Tuple, TypeVar)
+                    Optional, Sequence, Tuple, TypeVar)
 
 from electrum.i18n import _
-from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED
+from electrum.address_synchronizer import (TX_HEIGHT_FUTURE, TX_HEIGHT_LOCAL,
+                                           TX_HEIGHT_UNCONFIRMED)
 
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
@@ -335,6 +336,101 @@ def split_fee(weights: Dict[_K, int], fee_sat: int) -> Dict[_K, int]:
 # The components of a swap
 # ---------------------------------------------------------------------------
 
+class SwapStatus(Enum):
+    """How far along a swap is, judged by the transaction that ends it.
+
+    A swap is over when the lockup output has been spent *and that spend has
+    confirmed*: only then are its legs, and so its return, settled.  The three
+    other states are all "not yet", but they are worth telling apart because
+    they fail differently and only one of them is a problem:
+
+    * :attr:`IN_FLIGHT` -- the lockup is unspent (or the spend is timelocked).
+      Normal for a swap in progress.
+    * :attr:`UNCONFIRMED` -- the spend is in the mempool.  Normal; it will
+      become :attr:`FINAL` on the next block.
+    * :attr:`LOCAL` -- the spend is in the wallet but was never broadcast.
+      ``TxBatch.run_iteration`` (electrum/txbatcher.py) adds every batch
+      transaction to the wallet as local before broadcasting it, and when the
+      broadcast fails with no base transaction to fall back on it deliberately
+      *keeps* it -- "it is dangerous to remove the transaction... it might have
+      been broadcast".  The only retry lives in ``find_base_tx``, which returns
+      early once ``self._prevout`` is unset, so a batch stranded this way is
+      never rebroadcast and never removed.  It sits in the History tab as a
+      "Local" row forever.  That is upstream's behaviour, not this plugin's --
+      nothing here creates, broadcasts or removes transactions -- but this
+      status is what lets the Swaps history tab name it instead of dressing it
+      up as a swap that was served.
+    """
+
+    FINAL = 'final'              #: spending tx confirmed; the swap is over
+    UNCONFIRMED = 'unconfirmed'  #: spending tx is in the mempool
+    LOCAL = 'local'              #: spending tx never left this wallet
+    IN_FLIGHT = 'in_flight'      #: the lockup output is not spent yet
+
+    @property
+    def is_final(self) -> bool:
+        return self is SwapStatus.FINAL
+
+
+#: Human-readable status text, for the Swaps history tab's Status column.
+_SWAP_STATUS_LABELS: Dict['SwapStatus', str] = {}
+
+
+def format_swap_status(status: 'SwapStatus') -> str:
+    """One word (or two) for the Status column."""
+    if not _SWAP_STATUS_LABELS:  # built lazily so _() runs after i18n is set up
+        _SWAP_STATUS_LABELS.update({
+            SwapStatus.FINAL: _("Confirmed"),
+            SwapStatus.UNCONFIRMED: _("Unconfirmed"),
+            SwapStatus.LOCAL: _("Local"),
+            SwapStatus.IN_FLIGHT: _("In flight"),
+        })
+    return _SWAP_STATUS_LABELS.get(status, str(status.value))
+
+
+def format_local_note() -> str:
+    """Why a "Local" row is not a swap that was served.
+
+    Worth spelling out: the operator sees this row in Electrum's History tab
+    too, where nothing distinguishes it from a settled swap, and its most
+    likely cause is a batch that was never broadcast rather than anything the
+    taker did.
+    """
+    return _(
+        "The transaction that would end this swap is in this wallet but was "
+        "never broadcast, so the swap has not settled.\nElectrum's transaction "
+        "batcher adds a batch to the wallet before broadcasting it and keeps it "
+        "as \"Local\" if the broadcast fails, and it only retries while the "
+        "batch is still open.\n\nIt is left out of the net return. If it does "
+        "not clear, the usual remedy is to remove the local transaction from "
+        "the History tab, so its inputs are freed.")
+
+
+def swap_status(wallet: 'Abstract_Wallet', swap: Any) -> 'SwapStatus':
+    """Where ``swap`` stands, per the wallet's view of its spending tx.
+
+    The confirmed test is deliberately the same one
+    :func:`build_served_swap_rows` has always used -- a height above
+    ``TX_HEIGHT_UNCONFIRMED`` -- so which swaps count as served and final does
+    not change; the other heights merely get names now instead of all being
+    lumped together as "skip this one".
+    """
+    spending_txid = getattr(swap, 'spending_txid', None)
+    if not spending_txid:
+        return SwapStatus.IN_FLIGHT
+    try:
+        height = wallet.adb.get_tx_height(spending_txid).height()
+    except Exception:
+        return SwapStatus.IN_FLIGHT
+    if height > TX_HEIGHT_UNCONFIRMED:
+        return SwapStatus.FINAL
+    if height == TX_HEIGHT_LOCAL:
+        return SwapStatus.LOCAL
+    if height == TX_HEIGHT_FUTURE:
+        return SwapStatus.IN_FLIGHT
+    return SwapStatus.UNCONFIRMED  # TX_HEIGHT_UNCONFIRMED / TX_HEIGHT_UNCONF_PARENT
+
+
 class ComponentKind(Enum):
     """The pieces a submarine swap is made of, from this wallet's side."""
 
@@ -399,6 +495,10 @@ class ServedSwapRow(NamedTuple):
     role: 'SwapRole' = SwapRole.SERVED
     #: Titles of the legs that are ours but not in the wallet's history.
     missing_legs: Tuple[str, ...] = ()
+    #: How far along the swap is.  Defaults to :attr:`SwapStatus.FINAL` because
+    #: that is the only status :func:`build_served_swap_rows` ever produced, and
+    #: the Swap Server tab still asks for exactly those rows.
+    status: 'SwapStatus' = SwapStatus.FINAL
 
     @property
     def wallet_components(self) -> List[SwapComponent]:
@@ -413,11 +513,15 @@ class ServedSwapRow(NamedTuple):
     def counts_towards_total(self) -> bool:
         """True when this row may be added into the net return.
 
-        A row is excluded when a leg is missing (the sum would be partial) or
+        A row is excluded when a leg is missing (the sum would be partial),
         when we could not establish which side of the swap we were on (the sign
-        would be meaningless).
+        would be meaningless), or when the swap has not settled yet (there is
+        no result to report, and a stranded local batch would otherwise read as
+        one).
         """
-        return self.is_complete and self.role is SwapRole.SERVED
+        return (self.is_complete
+                and self.role is SwapRole.SERVED
+                and self.status is SwapStatus.FINAL)
 
 
 class _Leg(NamedTuple):
@@ -576,6 +680,20 @@ def _item_timestamp(item: Optional[Dict[str, Any]]) -> Optional[int]:
 def build_served_swap_rows(wallet: 'Abstract_Wallet') -> List[ServedSwapRow]:
     """One row per confirmed swap this node served to another wallet.
 
+    The Swap Server tab's population, unchanged: served swaps only, settled
+    swaps only.  See :func:`build_swap_rows`, of which this is the default case.
+    """
+    return build_swap_rows(wallet)
+
+
+def build_swap_rows(
+        wallet: 'Abstract_Wallet',
+        *,
+        include_own: bool = False,
+        include_pending: bool = False,
+) -> List[ServedSwapRow]:
+    """One row per swap, oldest first.
+
     Rows are keyed on the swap's payment hash rather than on the wallet's
     history groups, which is what makes a swap exactly one row: a group both
     collapses into its single member (so the row would be labelled after a leg
@@ -583,9 +701,18 @@ def build_served_swap_rows(wallet: 'Abstract_Wallet') -> List[ServedSwapRow]:
     transaction (so several swaps would be one row).  Values are attributed per
     swap, with the batch mining fee split across the legs that caused it.
 
-    Swaps the operator's own wallet initiated as a customer are left out.  They
-    still take part in the fee split, because their legs are in the same
-    transaction and the split has to account for all of them.
+    ``include_own`` keeps the swaps the operator's own wallet initiated as a
+    customer.  They are excluded by default because the Swap Server tab counts
+    what was *served*; they take part in the fee split either way, because their
+    legs are in the same transaction and the split has to account for all of
+    them.
+
+    ``include_pending`` keeps swaps that have not settled -- in flight, in the
+    mempool, or stranded as a local transaction.  Excluded by default so the
+    served-swap total only ever covers finished swaps; the Swaps history tab
+    asks for them so that a swap the operator can see in the History tab is
+    never missing from the swap-centric view of the same history.  Either way
+    :attr:`ServedSwapRow.counts_towards_total` keeps them out of the net return.
     """
     lnworker = getattr(wallet, 'lnworker', None)
     sm = getattr(lnworker, 'swap_manager', None) if lnworker else None
@@ -616,14 +743,13 @@ def build_served_swap_rows(wallet: 'Abstract_Wallet') -> List[ServedSwapRow]:
     rows: List[ServedSwapRow] = []
     for payment_hash, swap in swaps:
         role = classify_swap(swap, payment_hash, ledger)
-        if role is SwapRole.OWN:
+        if role is SwapRole.OWN and not include_own:
             continue
-        spending_txid = getattr(swap, 'spending_txid', None)
-        if spending_txid is None:
-            continue  # still in flight
-        if wallet.adb.get_tx_height(spending_txid).height() <= TX_HEIGHT_UNCONFIRMED:
+        status = swap_status(wallet, swap)
+        if status is not SwapStatus.FINAL and not include_pending:
             continue  # only final swaps, so the history is stable
         row = _build_row(
+            status=status, ledger=ledger,
             sm=sm, wallet=wallet, payment_hash=payment_hash, swap=swap, role=role,
             onchain_items=onchain_items, ln_items=ln_items,
             net_by_leg=net_by_leg, legs_by_tx=legs_by_tx, swaps_per_tx=swaps_per_tx,
@@ -645,6 +771,8 @@ def _build_row(
         net_by_leg: Dict[Tuple[str, str], int],
         legs_by_tx: Dict[str, List[_Leg]],
         swaps_per_tx: Dict[str, int],
+        status: 'SwapStatus' = SwapStatus.FINAL,
+        ledger: Optional[Dict[str, int]] = None,
 ) -> Optional[ServedSwapRow]:
     taker_is_forward = taker_did_forward_swap(swap, served=True)
     is_reverse = bool(getattr(swap, 'is_reverse', False))
@@ -747,9 +875,18 @@ def _build_row(
         expected_ours=is_reverse or is_refund,
     )
 
-    if not timestamps:
+    if timestamps:
+        timestamp = max(timestamps)
+    elif status is SwapStatus.FINAL:
         return None  # nothing of ours in the history yet; not reportable
-    timestamp = max(timestamps)
+    else:
+        # A swap that has not settled can legitimately have no leg in the
+        # history yet (nothing confirmed, nothing paid).  Dropping it would hide
+        # exactly the rows this tab exists to show, so fall back to when our
+        # server recorded the swap, and let the caller print no date when even
+        # that is unknown -- an invented date would sort the row somewhere it
+        # does not belong.
+        timestamp = int((ledger or {}).get(payment_hash, 0) or 0)
     batched_with = max(
         (swaps_per_tx.get(txid, 1) - 1
          for txid in {c.txid for c in components if c.is_onchain and c.in_wallet and c.txid}),
@@ -763,7 +900,7 @@ def _build_row(
             role=role, taker_is_forward=taker_is_forward,
             is_submarine_payment=bool(getattr(swap, 'claim_to_output', None)),
             amount_str=_format_amount(sm, swap_amount_sat(swap))),
-        date=_format_date(timestamp),
+        date=_format_date(timestamp) if timestamp else "",
         timestamp=timestamp,
         return_sat=None if missing_legs else total,
         taker_is_forward=taker_is_forward,
@@ -775,6 +912,7 @@ def _build_row(
         batched_with=batched_with,
         role=role,
         missing_legs=missing_legs,
+        status=status,
     )
 
 
@@ -850,88 +988,6 @@ def format_swap_label(
     return f"{mark} {text} {amount_str}".rstrip()
 
 
-def lightning_payment_hashes(wallet: 'Abstract_Wallet') -> Set[str]:
-    """The payment hashes the wallet's lightning history will show.
-
-    ``LNWallet.get_lightning_history`` is what ``get_full_history`` itself
-    calls, so membership here is exactly the question "will this swap have a
-    lightning row to be grouped with".  It walks settled htlcs in the wallet's
-    *current* channels, so a payment whose channel is gone is absent from it
-    even though the swap record survives.
-    """
-    lnworker = getattr(wallet, 'lnworker', None)
-    try:
-        return {key for key in lnworker.get_lightning_history()}
-    except Exception:
-        return set()
-
-
-def relabel_swap_history_groups(
-        wallet: 'Abstract_Wallet',
-        sm: 'SwapManager',
-        groups: Dict[str, Dict[str, Any]],
-) -> Dict[str, Dict[str, Any]]:
-    """Rewrite the labels of every swap group in ``groups`` in place.
-
-    ``groups`` is what ``SwapManager.get_groups_for_onchain_history`` returns:
-    ``{txid: {'group_id':…, 'label':…, 'group_label':…}}``.  Normally only the
-    group label changes, because the per-leg ``label`` ("Funding transaction",
-    "Claim transaction") is the component name and is what the operator wants to
-    read *inside* an expanded group.
-
-    The exception is a group that will not survive to be expanded.
-    ``Abstract_Wallet.get_full_history`` replaces a group by its single member
-    when it has only one (``if len(children) == 1: transactions[key] =
-    children[0]``), and the replacement is displayed under the *leg* label --
-    the group label, and with it everything this function does, never reaches
-    the screen.  That is why a swap whose lightning payment is missing from the
-    wallet shows up in the history as a bare "Claim transaction" with no swap
-    row anywhere: on-chain leg alone, group of one, collapsed.  So when a group
-    is going to collapse, the leg label is overwritten too.
-
-    Upstream rebuilds this mapping -- and re-applies the labels it carries -- on
-    every history refresh, which is why this has to run as a wrapper around it
-    rather than as a one-off write of ``wallet.set_group_label``.
-    """
-    ledger = served_swaps_ledger(wallet)
-    onchain_members: Dict[str, int] = {}
-    for entry in groups.values():
-        group_id = entry.get('group_id')
-        if group_id:
-            onchain_members[group_id] = onchain_members.get(group_id, 0) + 1
-    ln_hashes: Optional[Set[str]] = None
-
-    for payment_hash, swap in list(sm._swaps.items()):
-        group_id = swap.spending_txid if swap.is_reverse else swap.funding_txid
-        if group_id is None:
-            continue
-        role = classify_swap(swap, payment_hash, ledger)
-        label = format_swap_label(
-            role=role,
-            taker_is_forward=taker_did_forward_swap(
-                swap, served=role is not SwapRole.OWN),
-            is_submarine_payment=bool(getattr(swap, 'claim_to_output', None)),
-            amount_str=_format_amount(sm, swap_amount_sat(swap)),
-        )
-        collapses = False
-        if onchain_members.get(group_id, 0) <= 1:
-            # Only then can the lightning legs make the difference, so only then
-            # is it worth asking the lnworker for them.
-            if ln_hashes is None:
-                ln_hashes = lightning_payment_hashes(wallet)
-            prepay_hash = getattr(swap, 'prepay_hash', None)
-            prepay_hex = prepay_hash.hex() if isinstance(prepay_hash, bytes) else prepay_hash
-            collapses = not (payment_hash in ln_hashes
-                             or (prepay_hex is not None and prepay_hex in ln_hashes))
-        for txid, entry in groups.items():
-            if entry.get('group_id') != group_id:
-                continue
-            entry['group_label'] = label
-            if collapses and txid == group_id:
-                entry['label'] = label
-    return groups
-
-
 # ---------------------------------------------------------------------------
 # What the Status tab shows
 # ---------------------------------------------------------------------------
@@ -954,23 +1010,35 @@ def get_swap_summary(rows: Sequence[Any]) -> Dict[str, Any]:
 
     if not rows:
         return {'num_swaps': 0, 'overall_return_sat': 0, 'swaps_per_day': 0.0,
-                'num_batched': 0, 'num_incomplete': 0, 'num_unattributed': 0}
+                'num_batched': 0, 'num_incomplete': 0, 'num_unattributed': 0,
+                'num_pending': 0}
     num_batched = sum(1 for row in rows if field(row, 'batched_with'))
+    # A swap that has not settled has no result yet, so it is not "incomplete"
+    # or "unattributed" -- it is simply not finished.  Counting it under those
+    # headings as well would report one swap as two separate problems, and the
+    # remedy for a stranded local batch is nothing like the remedy for a swap
+    # whose lightning leg is gone.  So the finished rows are what the other
+    # counters and the total are computed over.
+    final = [row for row in rows
+             if field(row, 'status', SwapStatus.FINAL) is SwapStatus.FINAL]
+    num_pending = len(rows) - len(final)
     # Only rows whose every leg is in the wallet, and whose side we could
     # establish, may be added up: a partial sum is not a smaller return, and an
     # unattributed swap's sign says nothing.  Counting them separately is what
     # keeps the total honest instead of quietly wrong.
-    num_incomplete = sum(1 for row in rows if field(row, 'missing_legs', ()))
+    num_incomplete = sum(1 for row in final if field(row, 'missing_legs', ()))
     num_unattributed = sum(
-        1 for row in rows
+        1 for row in final
         if field(row, 'role', SwapRole.SERVED) is SwapRole.UNKNOWN)
     profit_loss_sum = sum(
         int(field(row, 'return_sat'))
-        for row in rows
+        for row in final
         if field(row, 'return_sat') is not None
         and field(row, 'role', SwapRole.SERVED) is SwapRole.SERVED)
-    timestamps = [int(field(row, 'timestamp')) for row in rows]
-    days = (max(timestamps) - min(timestamps)) // 86400
+    # A pending swap can have no date at all (nothing of it is in the history
+    # yet); such a row must not drag the span back to 1970 and flatten the rate.
+    timestamps = [ts for ts in (int(field(row, 'timestamp')) for row in rows) if ts]
+    days = ((max(timestamps) - min(timestamps)) // 86400) if timestamps else 0
     swaps_per_day = (len(rows) / days) if days > 0 else 0.0
     return {
         'num_swaps': len(rows),
@@ -979,6 +1047,7 @@ def get_swap_summary(rows: Sequence[Any]) -> Dict[str, Any]:
         'num_batched': num_batched,
         'num_incomplete': num_incomplete,
         'num_unattributed': num_unattributed,
+        'num_pending': num_pending,
     }
 
 
@@ -990,8 +1059,10 @@ def format_summary_line(
         num_batched: int,
         num_incomplete: int = 0,
         num_unattributed: int = 0,
+        num_pending: int = 0,
+        counts_own: bool = False,
 ) -> str:
-    """The one-line summary above the history table.
+    """The one-line summary above a swap table.
 
     Pure, and here rather than in ``qt.py``, so it is testable without PyQt6
     (same reasoning as :func:`save_settings`).  ``net_return`` arrives
@@ -1000,12 +1071,24 @@ def format_summary_line(
     The net return covers only the rows it can: any row left out of it is
     counted out loud on a second line, because a total that silently drops rows
     reads exactly like a total that includes them.
+
+    ``counts_own`` switches the heading for the Swaps history tab, which lists
+    the operator's own swaps alongside the served ones.  It is a whole separate
+    sentence rather than a substituted word so both stay translatable, and it
+    matters: "Swaps served: 17" over a table that is counting four of the
+    operator's own swaps would be a wrong number, not just a loose phrase.
     """
-    text = _("Swaps served: {num} · net return: {ret} · {rate}/day").format(
-        num=num_swaps, ret=net_return, rate=swaps_per_day)
+    if counts_own:
+        text = _("Swaps: {num} (served and own) · net return on served: {ret} · "
+                 "{rate}/day").format(num=num_swaps, ret=net_return, rate=swaps_per_day)
+    else:
+        text = _("Swaps served: {num} · net return: {ret} · {rate}/day").format(
+            num=num_swaps, ret=net_return, rate=swaps_per_day)
     if num_batched:
         text += " · " + _("{n} settled in a shared transaction").format(n=num_batched)
     notes = []
+    if num_pending:
+        notes.append(_("{n} not settled yet").format(n=num_pending))
     if num_incomplete:
         notes.append(_("{n} incomplete (a leg is not in this wallet)").format(
             n=num_incomplete))

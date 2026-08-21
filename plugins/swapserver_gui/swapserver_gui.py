@@ -159,13 +159,18 @@ ComponentKind = served_swaps.ComponentKind
 ServedSwapRow = served_swaps.ServedSwapRow
 SwapComponent = served_swaps.SwapComponent
 SwapRole = served_swaps.SwapRole
+SwapStatus = served_swaps.SwapStatus
 build_served_swap_rows = served_swaps.build_served_swap_rows
+build_swap_rows = served_swaps.build_swap_rows
 classify_swap = served_swaps.classify_swap
 format_batched_note = served_swaps.format_batched_note
 format_incomplete_note = served_swaps.format_incomplete_note
+format_local_note = served_swaps.format_local_note
 format_summary_line = served_swaps.format_summary_line
 format_swap_label = served_swaps.format_swap_label
+format_swap_status = served_swaps.format_swap_status
 format_unattributed_note = served_swaps.format_unattributed_note
+swap_status = served_swaps.swap_status
 get_swap_history = served_swaps.get_swap_history
 get_swap_summary = served_swaps.get_swap_summary
 is_served_swap = served_swaps.is_served_swap
@@ -359,8 +364,6 @@ class SwapServerGuiPlugin(BasePlugin):
         self._running: bool = False
         # The swap manager whose server_create_* methods we wrapped, if any.
         self._recorded_sm: Optional['SwapManager'] = None
-        # The swap manager whose history-group builder we wrapped, if any.
-        self._relabelled_sm: Optional['SwapManager'] = None
         # Set once the announcement proof-of-work is usable (or once we know we
         # cannot compute one, e.g. no nostr keypair). Gates the nostr announce
         # path so we never publish an offer that takers would reject.
@@ -508,74 +511,6 @@ class SwapServerGuiPlugin(BasePlugin):
             pass
         if sm is self._recorded_sm:
             self._recorded_sm = None
-
-    # ---------------------------------------------------------- history labels
-    #: Marks a SwapManager whose history-group builder we wrapped, and holds
-    #: whatever instance attribute was shadowing the class method before us.
-    _RELABEL_MARK = '_swapserver_gui_relabel'
-
-    def _install_history_relabeller(self, sm: 'SwapManager') -> None:
-        """Make swap rows in Electrum's history say which side we were on.
-
-        ``SwapManager.get_groups_for_onchain_history`` both builds the txid ->
-        group mapping *and*, via ``LNWallet.get_groups_for_onchain_history``,
-        writes the labels it carries into the wallet on every history refresh.
-        So a label we set once would be overwritten within seconds; wrapping the
-        builder is the only place the rewrite survives.  Instance-level, like
-        :meth:`_install_served_swap_recorder`, so upstream's class is untouched.
-
-        Installed for as long as the plugin is bound to a wallet, not just while
-        the server is running: the operator's history should keep saying which
-        swaps their server provided even with the server switched off.
-        """
-        if getattr(sm, self._RELABEL_MARK, None) is not None:
-            return  # already wrapped
-        wallet = self.wallet
-        if wallet is None:
-            return
-        name = 'get_groups_for_onchain_history'
-        original = getattr(sm, name, None)
-        if original is None:
-            self.logger.debug(f"swap manager has no {name}; not relabelling history")
-            return
-
-        @functools.wraps(original)
-        def wrapper(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-            groups = original(*args, **kwargs)
-            try:
-                return served_swaps.relabel_swap_history_groups(wallet, sm, groups)
-            except Exception:
-                # The history must render even if we cannot classify a swap;
-                # upstream's labels are a perfectly good fallback.
-                self.logger.warning("could not relabel swap history groups",
-                                    exc_info=True)
-                return groups
-        shadowed = {name: sm.__dict__.get(name)}  # captured before we overwrite it
-        setattr(sm, name, wrapper)
-        setattr(sm, self._RELABEL_MARK, shadowed)
-        self._relabelled_sm = sm
-
-    def _remove_history_relabeller(self, sm: Optional['SwapManager'] = None) -> None:
-        """Undo :meth:`_install_history_relabeller`. Idempotent."""
-        if sm is None:
-            sm = self._relabelled_sm
-        if sm is None:
-            return
-        shadowed = getattr(sm, self._RELABEL_MARK, None)
-        if shadowed is None:
-            self._relabelled_sm = None
-            return
-        for name, previous in shadowed.items():
-            if previous is None:
-                sm.__dict__.pop(name, None)  # expose the class method again
-            else:
-                setattr(sm, name, previous)
-        try:
-            delattr(sm, self._RELABEL_MARK)
-        except AttributeError:
-            pass
-        if sm is self._relabelled_sm:
-            self._relabelled_sm = None
 
     # ------------------------------------------------------------ proof of work
     def _nostr_pubkey(self) -> Optional[bytes]:
@@ -916,20 +851,24 @@ class SwapServerGuiPlugin(BasePlugin):
 
     # -------------------------------------------------------------- lifecycle
     def bind_wallet(self, wallet: 'Abstract_Wallet') -> None:
-        """Associate this plugin instance with a wallet's swap manager."""
+        """Associate this plugin instance with a wallet's swap manager.
+
+        Note what this deliberately does *not* do: wrap
+        ``SwapManager.get_groups_for_onchain_history``.  This plugin used to,
+        in order to relabel swap rows in Electrum's own History tab, and that
+        is now the "History (Swaps)" tab's job instead -- see
+        ``qt.SwapHistoryTab``.  Electrum's History tab is left exactly as
+        upstream renders it.
+        """
         self.wallet = wallet
         self._sm = wallet.lnworker.swap_manager if wallet.lnworker else None
-        if self._sm is not None:
-            self._install_history_relabeller(self._sm)
 
     def unbind_wallet(self) -> None:
         """Drop everything this plugin hung on the wallet's swap manager.
 
         Called when the wallet is closed or the plugin disabled.  The recorder
-        is tied to the running server and comes off in :meth:`stop_server`; the
-        history relabeller outlives it, so it is removed here.
+        is tied to the running server and comes off in :meth:`stop_server`.
         """
-        self._remove_history_relabeller()
         self._remove_served_swap_recorder()
         self.wallet = None
         self._sm = None
