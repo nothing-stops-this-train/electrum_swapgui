@@ -855,7 +855,7 @@ if HAVE_QT:
             self.fx.is_enabled.return_value = False
             self.app = mock.MagicMock()
             self.gui_thread = threading.current_thread()
-            self.tabs = QTabWidget()
+            self.tabs = QTabWidget(self)
             self.format_amount = lambda value, **kw: str(value)
             self.show_message = mock.MagicMock()
             self.show_critical = mock.MagicMock()
@@ -904,9 +904,15 @@ class _HistoryTabHarness:
         plugin.bind_wallet(wallet)
 
         window = _HistoryWindow(wallet, config)
-        self.addCleanup(window.deleteLater)
         tab = qt_mod.SwapHistoryTab(plugin, window)
-        self.addCleanup(tab.clean_up)
+        # Held on the instance, and torn down in one ordered step below: the
+        # view keeps a plain Python reference to the window (MyTreeView.
+        # main_window), so a window collected while the tab is still alive
+        # leaves the view painting through a dangling wrapper -- which shows up
+        # as an AttributeError from deep inside upstream's headerData in
+        # *another* test, or as an abort.
+        self._live = (config, plugin, wallet, window, tab)
+        self.addCleanup(self._teardown, tab, window)
         if show:
             # The model skips a refresh while its view is hidden, which is what
             # makes the periodic rebuild free -- so a test that wants rows has
@@ -914,6 +920,18 @@ class _HistoryTabHarness:
             tab.show()
             self.app.processEvents()
         return tab, wallet, window
+
+    def _teardown(self, tab, window):
+        """Delete the widgets now, rather than whenever the GC gets to them."""
+        tab.clean_up()
+        tab.hide()
+        tab.setParent(None)
+        tab.deleteLater()
+        window.deleteLater()
+        self._live = None
+        # deleteLater only queues; flush it here so nothing half-deleted is
+        # still around to be painted once the next test calls processEvents.
+        self.app.processEvents()
 
     @staticmethod
     def _labels(tab):
@@ -1176,8 +1194,17 @@ class TabRegistrationTests(_TabHarness, unittest.TestCase):
         wallet.get_full_history.side_effect = lambda *a, **kw: OrderedDictWithIndex()
         wallet._get_label.return_value = ''
         window = _HistoryWindow(wallet, config)
-        self.addCleanup(window.deleteLater)
+        # Same ordering hazard as _HistoryTabHarness._teardown: the tabs this
+        # plugin adds hold a plain Python reference to the window.
+        self._live = (config, plugin, wallet, window)
+        self.addCleanup(self._teardown, plugin, window)
         return plugin, window
+
+    def _teardown(self, plugin, window):
+        plugin._remove_tab()          # idempotent; stops the timers first
+        window.deleteLater()
+        self._live = None
+        QApplication.instance().processEvents()
 
     def test_both_tabs_are_added(self):
         plugin, window = self._plugin_with_window()
