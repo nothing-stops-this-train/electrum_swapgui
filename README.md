@@ -4,7 +4,9 @@ A Qt GUI plugin for [Electrum](https://github.com/spesmilo/electrum) that adds a
 **Swap Server** tab for managing Electrum's built-in submarine swap server
 ([docs](https://electrum.readthedocs.io/en/latest/swapserver.html)).
 
-** This software is provided AS-IS without any warranty. You are responsible for the security of your own funds. **
+**This software is provided AS-IS without any warranty. You are responsible for the security of your own funds. This plugin just enables Electrum's built-in swap server, it does not manage any funds or swaps on its own.**
+
+You may wish to combine this plugin with the [liquidity management plugin](https://github.com/BareBits/electrum_liquidity) to make sure you always have room in your lightning channels to serve swaps. Just set your liquidity management max swap cost % to be lower than the swaps you offer via your swap server to make sure you are actually making a profit.
 
 ![The Swap Server tab](docs/swap_server_tab.png)
 
